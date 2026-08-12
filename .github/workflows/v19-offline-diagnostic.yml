@@ -1,0 +1,45 @@
+name: V19 Offline Receipt Diagnostic
+
+on:
+  push:
+    branches:
+      - v19-production-readiness
+    paths:
+      - 'tools/v19_offline_diagnostic.py'
+      - '.github/workflows/v19-offline-diagnostic.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: zhirox
+          POSTGRES_PASSWORD: zhirox_test_password
+          POSTGRES_DB: zhirox_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zhirox -d zhirox_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://zhirox:zhirox_test_password@127.0.0.1:5432/zhirox_test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v19-production-readiness
+      - name: Generate diagnostic offline core
+        run: python3 tools/v19_offline_diagnostic.py
+      - name: Install server
+        working-directory: source/server
+        run: npm ci
+      - name: Run integration tests with diagnostic assertion
+        working-directory: source/server
+        run: npm test
