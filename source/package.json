@@ -16,7 +16,7 @@
     "lucide-react": "^1.16.0",
     "react": "19.2.6",
     "react-dom": "19.2.6",
-    "react-router-dom": "^7.15.1",
+    "react-router-dom": "^7.18.2",
     "tailwind-merge": "3.4.0",
     "uuid": "^14.0.0",
     "zustand": "^5.0.13"
@@ -29,7 +29,7 @@
     "@vitejs/plugin-react": "5.1.1",
     "tailwindcss": "4.1.17",
     "typescript": "5.9.3",
-    "vite": "7.3.2",
+    "vite": "^7.3.6",
     "vite-plugin-singlefile": "2.3.0"
   }
 }
