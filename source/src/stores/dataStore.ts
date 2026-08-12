@@ -58,6 +58,7 @@ interface DataState {
   upsertAuthoritativeProduct: (product: ServerProduct) => void;
   upsertAuthoritativeCustomer: (customer: ServerCustomer) => void;
   applyAuthoritativeSale: (response: ServerSaleCommit, userId: string, cartSnapshot: Cart) => Sale;
+  reconcileOfflineSale: (provisionalSaleId: string, response: ServerSaleCommit, userId: string, cartSnapshot: Cart) => Sale;
 
   // Counters
   receiptCounter: number;
@@ -179,6 +180,10 @@ export const useDataStore = create<DataState>()(
         const stockMovements:StockMovement[]=response.items.map(line=>{const current=get().getProductById(line.product_id);return{id:`sm-${response.sale_id}-${line.product_id}`,market_id:tenant.marketId,branch_id:tenant.branchId,product_id:line.product_id,product:current,type:'sale',quantity:-line.quantity,stock_before:line.stock_after+line.quantity,stock_after:line.stock_after,reference_type:'sale',reference_id:response.sale_id,created_by:userId,created_at:now};});
         set(state=>({sales:[...state.sales.filter(s=>s.id!==sale.id),sale],saleItems:[...state.saleItems.filter(i=>i.sale_id!==sale.id),...saleItems],payments:[...state.payments.filter(p=>p.reference_id!==sale.id),...payments],debtTransactions:[...state.debtTransactions.filter(d=>d.reference_id!==sale.id),...debtTransactions],stockMovements:[...state.stockMovements.filter(m=>m.reference_id!==sale.id),...stockMovements],products:state.products.map(p=>{const line=response.items.find(i=>i.product_id===p.id);return line?{...p,stock_quantity:line.stock_after,updated_at:now}:p;}),customerBalances:state.customerBalances.map(b=>response.customer_id&&b.customer_id===response.customer_id&&response.customer_balance_iqd!==null?{...b,balance_iqd:response.customer_balance_iqd,updated_at:now}:b),cart:emptyCart}));
         return sale;
+      },
+      reconcileOfflineSale: (provisionalSaleId,response,userId,cartSnapshot) => {
+        set(state=>({sales:state.sales.filter(s=>s.id!==provisionalSaleId),saleItems:state.saleItems.filter(i=>i.sale_id!==provisionalSaleId),payments:state.payments.filter(p=>p.reference_id!==provisionalSaleId),debtTransactions:state.debtTransactions.filter(d=>d.reference_id!==provisionalSaleId),stockMovements:state.stockMovements.filter(m=>m.reference_id!==provisionalSaleId)}));
+        return get().applyAuthoritativeSale(response,userId,cartSnapshot);
       },
       receiptCounter: 1000,
 

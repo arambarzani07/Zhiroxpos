@@ -414,6 +414,7 @@ test('offline writer lease blocks a different device and reserves a unique recei
   const seq=acquired.json.block.start_sequence; const receipt=`${acquired.json.block.receipt_prefix}-20260812-${String(seq).padStart(6,'0')}`;
   const offlineBody={client_operation_id:'offline-operation-1',payment_method:'cash',paid_iqd:500,items:[{product_id:'lease-product',quantity:1}],offline_receipt:{lease_id:acquired.json.lease_id,lease_token:acquired.json.lease_token,block_id:acquired.json.block.id,receipt_number:receipt,business_date:'2026-08-12',sequence:seq,captured_at:new Date(acquired.json.starts_at).toISOString()}};
   const offline=await request('/api/v1/sales/commit',{method:'POST',headers:{'idempotency-key':'offline-sale-key-1'},body:offlineBody}); assert.equal(offline.response.status,201); assert.equal(offline.json.receipt_number,receipt);
+  const attribution=await pool.query('SELECT cashier_id FROM sales WHERE id=$1',[offline.json.sale_id]); const leaseActor=await pool.query('SELECT created_by FROM offline_leases WHERE id=$1',[acquired.json.lease_id]); assert.equal(attribution.rows[0].cashier_id,leaseActor.rows[0].created_by);
   const release=await request('/api/v1/offline/lease/release',{method:'POST',body:{lease_id:acquired.json.lease_id,lease_token:acquired.json.lease_token}}); assert.equal(release.response.status,200);
   const stock=await pool.query("SELECT stock_quantity FROM products WHERE id='lease-product'"); assert.equal(Number(stock.rows[0].stock_quantity),2);
 });

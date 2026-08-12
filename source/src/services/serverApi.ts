@@ -1,3 +1,5 @@
+import { DeviceIdentityError, getDeviceId, getDeviceLabel } from './deviceIdentity';
+
 export type ServerRole = 'owner' | 'admin' | 'cashier' | 'stock_staff' | 'accountant';
 
 export interface ServerUser {
@@ -50,16 +52,19 @@ const API_BASE = String(viteEnv?.VITE_API_BASE_URL || '').replace(/\/$/, '');
 async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
   let response: Response;
   try {
+    const deviceId=getDeviceId();
     response = await fetch(`${API_BASE}${path}`, {
       ...init,
       credentials: 'include',
       headers: {
         accept: 'application/json',
+        'x-device-id': deviceId,
         ...(init.body ? { 'content-type': 'application/json' } : {}),
         ...(init.headers || {}),
       },
     });
-  } catch {
+  } catch (error) {
+    if(error instanceof DeviceIdentityError)throw new ApiError(0,error.message);
     throw new ApiError(0, 'NETWORK_UNAVAILABLE');
   }
 
@@ -80,6 +85,9 @@ export interface ServerCustomer {
   id:string; market_id:string; code:string; name:string; phone?:string|null; address?:string|null; notes?:string|null;
   debt_limit_iqd:number|null; balance_iqd:number; status:'active'|'blocked'; version:number; created_at:string; updated_at:string;
 }
+export interface OfflineReceiptProof {lease_id:string;lease_token:string;block_id:string;receipt_number:string;business_date:string;sequence:number;captured_at:string;}
+export interface SaleCommitInput {client_operation_id:string;customer_id?:string;payment_method:'cash'|'card'|'bank'|'debt'|'mixed';paid_method?:'cash'|'card'|'bank';paid_iqd:number;discount_iqd:number;items:Array<{product_id:string;quantity:number}>;offline_receipt?:OfflineReceiptProof;}
+export interface OfflineLeaseGrant {lease_id:string;device_id:string;starts_at:string;expires_at:string;lease_token:string;block:{id:string;business_date:string;receipt_prefix:string;start_sequence:number;end_sequence:number};}
 export interface ServerSaleCommit {
   sale_id:string; receipt_number:string; payment_method:'cash'|'card'|'bank'|'debt'|'mixed'; paid_method:'cash'|'card'|'bank'|null;
   customer_id:string|null; subtotal_iqd:number; discount_iqd:number; total_iqd:number; paid_iqd:number; debt_iqd:number;
@@ -134,7 +142,10 @@ export const serverApi = {
     const key=operationId('customer-save');
     return apiFetch<{customer:ServerCustomer}>('/api/v1/customers/save',{method:'POST',headers:{'idempotency-key':key},body:JSON.stringify(input)});
   },
-  commitSale: (input:{client_operation_id:string;customer_id?:string;payment_method:'cash'|'card'|'bank'|'debt'|'mixed';paid_method?:'cash'|'card'|'bank';paid_iqd:number;discount_iqd:number;items:Array<{product_id:string;quantity:number}>}, idempotencyKey:string) =>
+  registerDevice: () => apiFetch<{device_id:string;market_id:string;branch_id:string}>('/api/v1/devices/register',{method:'POST',body:JSON.stringify({device_id:getDeviceId(),label:getDeviceLabel()})}),
+  acquireOfflineLease: (durationMinutes=30,blockSize=100) => {const key=operationId('lease-acquire');return apiFetch<OfflineLeaseGrant>('/api/v1/offline/lease/acquire',{method:'POST',headers:{'idempotency-key':key},body:JSON.stringify({duration_minutes:durationMinutes,block_size:blockSize})});},
+  releaseOfflineLease: (leaseId:string,leaseToken:string) => apiFetch<{ok:true}>('/api/v1/offline/lease/release',{method:'POST',body:JSON.stringify({lease_id:leaseId,lease_token:leaseToken})}),
+  commitSale: (input:SaleCommitInput, idempotencyKey:string) =>
     apiFetch<ServerSaleCommit>('/api/v1/sales/commit',{method:'POST',headers:{'idempotency-key':idempotencyKey},body:JSON.stringify(input)}),
   createOperationId: operationId,
   reserveReceipt: (idempotencyKey: string, businessDate?: string) => apiFetch<{ receipt_number: string; sequence: number; business_date: string }>('/api/v1/receipts/reserve', {

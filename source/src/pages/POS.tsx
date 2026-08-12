@@ -19,6 +19,8 @@ import {
   Play,
   Tag,
   RotateCcw,
+  Wifi,
+  WifiOff,
 } from 'lucide-react';
 import { useAuthStore } from '../stores/authStore';
 import { useDataStore } from '../stores/dataStore';
@@ -44,6 +46,7 @@ import { QuickCustomerAddModal } from '../components/features/QuickCustomerAdd';
 import { LastSaleReprintButton } from '../components/features/LastSalesWidget';
 import { ProductQuickView } from '../components/features/ProductQuickView';
 import { ApiError, serverApi } from '../services/serverApi';
+import { clearOfflineLease, flushOfflineQueue, getOfflineLease, pendingOfflineCount, provisionalResponseFromCart, queueOfflineSale, reserveOfflineReceipt, saveOfflineLease, type StoredOfflineLease } from '../services/offlineQueue';
 
 function formatCurrency(amount: number, currency: 'IQD' | 'USD' = 'IQD'): string {
   if (currency === 'USD') return `$${amount.toLocaleString()}`;
@@ -78,6 +81,9 @@ export function POSPage() {
   const [quickViewProduct, setQuickViewProduct] = useState<Product | null>(null);
   const [isCompleting, setIsCompleting] = useState(false);
   const pendingOperationRef = useRef<{key:string;operationId:string}|null>(null);
+  const [offlineLease,setOfflineLease]=useState<StoredOfflineLease|null>(null);
+  const [offlinePending,setOfflinePending]=useState(0);
+  const [offlineBusy,setOfflineBusy]=useState(false);
 
   const { user } = useAuthStore();
   const {
@@ -117,6 +123,13 @@ export function POSPage() {
     if (window.innerWidth >= 1024) barcodeInputRef.current?.focus();
   }, []);
 
+  const refreshOfflineState=async()=>{setOfflineLease(await getOfflineLease());setOfflinePending(await pendingOfflineCount());};
+  useEffect(()=>{void refreshOfflineState();const onOnline=()=>{void (async()=>{try{const result=await flushOfflineQueue();if(result.synced>0)toast.success(`${result.synced} مامەڵەی ئۆفلاین هاوکات کرا`);}finally{await refreshOfflineState();}})();};window.addEventListener('online',onOnline);return()=>window.removeEventListener('online',onOnline);},[]);
+
+  const acquireOfflineMode=async()=>{if(!navigator.onLine){toast.error('بۆ وەرگرتنی مۆڵەتی ئۆفلاین پێویستە ئینتەرنێت هەبێت');return;}setOfflineBusy(true);try{const grant=await serverApi.acquireOfflineLease(30,100);await saveOfflineLease(grant);await refreshOfflineState();toast.success('ئەم ئامێرە بۆ ٣٠ خولەک offline-writer ـە');}catch(error){const code=error instanceof ApiError?error.code:'UNKNOWN_ERROR';toast.error(code==='OFFLINE_LEASE_ALREADY_ACTIVE'?'ئامێرێکی تر مۆڵەتی ئۆفلاینی هەیە':code);}finally{setOfflineBusy(false);}};
+  const releaseOfflineMode=async()=>{if(!offlineLease)return;if(offlinePending>0){toast.error('سەرەتا مامەڵە ئۆفلاینەکان هاوکات بکە');return;}setOfflineBusy(true);try{await serverApi.releaseOfflineLease(offlineLease.lease_id,offlineLease.lease_token);await clearOfflineLease();await refreshOfflineState();toast.success('مۆڵەتی ئۆفلاین داخرا');}catch(error){toast.error(error instanceof ApiError?error.code:'UNKNOWN_ERROR');}finally{setOfflineBusy(false);}};
+
+
   const handleBarcodeSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const barcode = searchQuery.trim();
@@ -153,8 +166,15 @@ export function POSPage() {
       pendingOperationRef.current=null; setShowReceiptModal(true); setShowMobileCart(false); setDiscountValue(0); playSaleSound(); toast.success(translations.pos.sale_completed);
     } catch(error) {
       const code=error instanceof ApiError?error.code:'UNKNOWN_ERROR';
-      const messages:Record<string,string>={NETWORK_UNAVAILABLE:'پەیوەندی بە سێرڤەر نییە؛ مامەڵە تۆمار نەکرا',STOCK_INSUFFICIENT:'کۆگا بەس نییە',PRODUCT_UNAVAILABLE:'کالا لە سێرڤەر بەردەست نییە',CREDIT_LIMIT_EXCEEDED:'سنووری قەرزی کڕیار تێدەپەڕێت',CUSTOMER_REQUIRED_FOR_DEBT:'بۆ قەرز کڕیار دیاری بکە',DISCOUNT_REQUIRES_APPROVAL:'داشکاندن پێویستی بە پەسەندی بەڕێوەبەر هەیە',VERSION_CONFLICT:'داتا لە ئامێرێکی تر گۆڕاوە'};
-      toast.error(messages[code]||code);
+      if(code==='NETWORK_UNAVAILABLE'){
+        try{
+          if(!offlineLease)throw new ApiError(0,'OFFLINE_LEASE_REQUIRED');
+          if(cart.discount_amount>0&&!['owner','admin'].includes(user.role?.type||''))throw new ApiError(0,'DISCOUNT_REQUIRES_APPROVAL');
+          for(const item of cart.items){if(item.product.is_trackable&&item.quantity>item.product.stock_quantity)throw new ApiError(0,'STOCK_INSUFFICIENT');}
+          if(cart.debt_amount>0){if(!cart.customer_id)throw new ApiError(0,'CUSTOMER_REQUIRED_FOR_DEBT');const customer=customers.find(c=>c.id===cart.customer_id);const balance=getCustomerBalance(cart.customer_id)?.balance_iqd||0;if(customer?.debt_limit!==undefined&&balance+cart.debt_amount>customer.debt_limit)throw new ApiError(0,'CREDIT_LIMIT_EXCEEDED');}
+          const receipt=await reserveOfflineReceipt();const payload={client_operation_id:pending.operationId,customer_id:cart.customer_id,payment_method:cart.payment_type,paid_method:'cash' as const,paid_iqd:cart.paid_amount,discount_iqd:cart.discount_amount,items:cart.items.map(item=>({product_id:item.product.id,quantity:item.quantity})),offline_receipt:receipt};const provisional=provisionalResponseFromCart(cartSnapshot,receipt,pending.operationId);if(cart.customer_id)provisional.customer_balance_iqd=(getCustomerBalance(cart.customer_id)?.balance_iqd||0)+cart.debt_amount;const sale=applyAuthoritativeSale(provisional,user.id,cartSnapshot);await queueOfflineSale({idempotencyKey:pending.key,operationId:pending.operationId,payload,provisionalSaleId:sale.id,cartSnapshot,userId:user.id,createdAt:new Date().toISOString()});pendingOperationRef.current=null;setCompletedSale(sale);setCompletedItems(savedItems);setShowReceiptModal(true);setShowMobileCart(false);setDiscountValue(0);playSaleSound();await refreshOfflineState();toast.success('مامەڵە بە ئۆفلاین تۆمار کرا؛ دوای ئینتەرنێت هاوکات دەبێت');
+        }catch(offlineError){const offlineCode=offlineError instanceof ApiError?offlineError.code:'UNKNOWN_ERROR';const offlineMessages:Record<string,string>={OFFLINE_LEASE_REQUIRED:'ئەم ئامێرە مۆڵەتی offline-writer نییە',OFFLINE_LEASE_EXPIRED:'مۆڵەتی ئۆفلاین کۆتایی هاتووە',OFFLINE_RECEIPT_DATE_CHANGED:'ڕۆژی کار گۆڕاوە؛ بۆ block ـی نوێ پێویستە ئینتەرنێت بگەڕێتەوە',OFFLINE_RECEIPT_BLOCK_EXHAUSTED:'ژمارە پسوڵە ئۆفلاینەکان تەواو بوون',STOCK_INSUFFICIENT:'کۆگا بەس نییە',CREDIT_LIMIT_EXCEEDED:'سنووری قەرزی کڕیار تێدەپەڕێت',CUSTOMER_REQUIRED_FOR_DEBT:'بۆ قەرز کڕیار دیاری بکە',DISCOUNT_REQUIRES_APPROVAL:'داشکاندن پێویستی بە پەسەندی بەڕێوەبەر هەیە'};toast.error(offlineMessages[offlineCode]||offlineCode);}
+      }else{const messages:Record<string,string>={BRANCH_OFFLINE_LEASE_ACTIVE:'لقەکە لە دۆخی ئۆفلاینە؛ تەنها ئامێری مۆڵەتپێدراو دەتوانێت بنووسێت',DEVICE_NOT_REGISTERED:'ئەم ئامێرە لە سێرڤەر تۆمار نەکراوە',STOCK_INSUFFICIENT:'کۆگا بەس نییە',PRODUCT_UNAVAILABLE:'کالا لە سێرڤەر بەردەست نییە',CREDIT_LIMIT_EXCEEDED:'سنووری قەرزی کڕیار تێدەپەڕێت',CUSTOMER_REQUIRED_FOR_DEBT:'بۆ قەرز کڕیار دیاری بکە',DISCOUNT_REQUIRES_APPROVAL:'داشکاندن پێویستی بە پەسەندی بەڕێوەبەر هەیە'};toast.error(messages[code]||code);}
     } finally { setIsCompleting(false); }
   };
 
@@ -390,6 +410,12 @@ export function POSPage() {
         {/* Cash Session + Tools */}
         <div className="flex items-center gap-2 mb-3 flex-shrink-0 flex-wrap">
           <CashSessionBar />
+          <div className={`px-3 py-2 rounded-xl text-xs font-medium flex items-center gap-2 ${offlineLease?'bg-amber-100 text-amber-800':'bg-slate-100 text-slate-600'}`}>
+            {navigator.onLine?<Wifi className="w-4 h-4"/>:<WifiOff className="w-4 h-4"/>}
+            <span>{offlineLease?`Offline writer • ${offlinePending} pending`:'Online authority'}</span>
+          </div>
+          {!offlineLease?<button disabled={offlineBusy||!navigator.onLine} onClick={()=>void acquireOfflineMode()} className="px-3 py-2 bg-indigo-100 text-indigo-700 rounded-xl text-xs font-medium disabled:opacity-50">مۆڵەتی ئۆفلاین</button>:<button disabled={offlineBusy||offlinePending>0||!navigator.onLine} onClick={()=>void releaseOfflineMode()} className="px-3 py-2 bg-amber-100 text-amber-800 rounded-xl text-xs font-medium disabled:opacity-50">داخستنی ئۆفلاین</button>}
+
           <button onClick={() => setShowReturn(true)} className="px-3 py-2 bg-amber-100 text-amber-700 rounded-xl text-sm font-medium hover:bg-amber-200 transition-colors flex items-center gap-1.5">
             <RotateCcw className="w-4 h-4" />
             <span className="hidden sm:inline">گەڕانەوە</span>

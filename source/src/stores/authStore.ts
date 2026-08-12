@@ -97,12 +97,14 @@ async function bindTenant(context: ReturnType<typeof toLocalContext> | null) {
   const { useDataStore } = await import('./dataStore');
   if (!context?.branch) { useDataStore.getState().clearTenantContext(); return; }
   useDataStore.getState().setTenantContext(context.market.id, context.branch.id);
+  await serverApi.registerDevice();
   try {
     const [products,customers]=await Promise.all([serverApi.loadProducts(),serverApi.loadCustomers()]);
     useDataStore.getState().hydrateAuthoritativeCatalog(products,customers);
   } catch (error) {
     console.warn('Authoritative catalog hydration failed; keeping last local cache', error);
   }
+  try { const {flushOfflineQueue}=await import('../services/offlineQueue'); await flushOfflineQueue(); } catch(error) { console.warn('Offline queue sync deferred',error); }
 }
 
 export const useAuthStore = create<AuthState>((set, get) => ({

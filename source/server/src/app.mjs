@@ -108,7 +108,7 @@ async function allocateReceiptBlock(client,user,deviceId,leaseId,date,size){
 }
 async function validateOfflineReceipt(client,user,deviceId,offline,secret){
   if(!offline||!secret||!validEntityId(offline.lease_id)||!validDate(offline.business_date)||!Number.isSafeInteger(Number(offline.sequence))) return {error:'INVALID_OFFLINE_RECEIPT'};
-  const leaseResult=await client.query(`SELECT id,device_id,starts_at,expires_at,revoked_at FROM offline_leases WHERE id=$1 AND market_id=$2 AND branch_id=$3`,[String(offline.lease_id),user.market_id,user.branch_id]);
+  const leaseResult=await client.query(`SELECT id,device_id,starts_at,expires_at,revoked_at,created_by FROM offline_leases WHERE id=$1 AND market_id=$2 AND branch_id=$3`,[String(offline.lease_id),user.market_id,user.branch_id]);
   const lease=leaseResult.rows[0]; if(!lease||lease.device_id!==deviceId)return {error:'OFFLINE_LEASE_INVALID'};
   const expected=leaseToken(secret,lease.id,deviceId,lease.expires_at); if(!safeTokenEqual(expected,String(offline.lease_token||'')))return {error:'OFFLINE_LEASE_INVALID'};
   const captured=new Date(String(offline.captured_at||'')); if(Number.isNaN(captured.getTime())||captured<new Date(lease.starts_at)||captured>new Date(lease.expires_at)||(lease.revoked_at&&captured>new Date(lease.revoked_at)))return {error:'OFFLINE_CAPTURE_OUTSIDE_LEASE'};
@@ -116,7 +116,7 @@ async function validateOfflineReceipt(client,user,deviceId,offline,secret){
   const block=blockResult.rows[0]; const sequence=Number(offline.sequence); if(!block||sqlDateString(block.business_date)!==String(offline.business_date)||sequence<Number(block.start_sequence)||sequence>Number(block.end_sequence))return {error:'OFFLINE_RECEIPT_BLOCK_INVALID'};
   const receiptNumber=`${block.receipt_prefix}-${String(offline.business_date).replaceAll('-','')}-${String(sequence).padStart(6,'0')}`;
   if(receiptNumber!==String(offline.receipt_number||''))return {error:'OFFLINE_RECEIPT_NUMBER_INVALID'};
-  return {receiptNumber};
+  return {receiptNumber,capturedByUserId:lease.created_by};
 }
 
 const validPaymentMethod = value => ['cash', 'card', 'bank', 'debt', 'mixed'].includes(String(value ?? ''));
@@ -851,13 +851,13 @@ export function createHandler(pool, configInput = {}) {
             }
           }
 
-          let receiptNumber;
-          if(offlineReceipt){const verified=await validateOfflineReceipt(client,user,device.id,offlineReceipt,config.offlineLeaseSecret);if(verified.error)return {status:409,body:{error:verified.error}};receiptNumber=verified.receiptNumber;}else{receiptNumber=(await nextReceipt(client,user,date)).receiptNumber;}
+          let receiptNumber; let saleActorId=user.id;
+          if(offlineReceipt){const verified=await validateOfflineReceipt(client,user,device.id,offlineReceipt,config.offlineLeaseSecret);if(verified.error)return {status:409,body:{error:verified.error}};receiptNumber=verified.receiptNumber;saleActorId=verified.capturedByUserId;}else{receiptNumber=(await nextReceipt(client,user,date)).receiptNumber;}
           const saleId = createId('sale');
           await client.query(
             `INSERT INTO sales (id, market_id, branch_id, receipt_number, cashier_id, customer_id, client_operation_id, payment_method, subtotal_iqd, discount_iqd, total_iqd, paid_iqd, debt_iqd)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-            [saleId, user.market_id, user.branch_id, receiptNumber, user.id, body.customer_id || null, body.client_operation_id, body.payment_method, subtotal, discountIqd, total, paidIqd, debt]
+            [saleId, user.market_id, user.branch_id, receiptNumber, saleActorId, body.customer_id || null, body.client_operation_id, body.payment_method, subtotal, discountIqd, total, paidIqd, debt]
           );
 
           for (const line of lines) {
@@ -871,7 +871,7 @@ export function createHandler(pool, configInput = {}) {
             await client.query(
               `INSERT INTO stock_movements (id, market_id, branch_id, product_id, movement_type, quantity_delta, stock_before, stock_after, reference_type, reference_id, created_by)
                VALUES ($1,$2,$3,$4,'sale',$5,$6,$7,'sale',$8,$9)`,
-              [createId('stock'), user.market_id, user.branch_id, line.product.id, -line.quantity, line.stockBefore, line.stockAfter, saleId, user.id]
+              [createId('stock'), user.market_id, user.branch_id, line.product.id, -line.quantity, line.stockBefore, line.stockAfter, saleId, saleActorId]
             );
           }
 
@@ -881,7 +881,7 @@ export function createHandler(pool, configInput = {}) {
             await client.query(
               `INSERT INTO payments (id, market_id, branch_id, sale_id, customer_id, method, amount_iqd, received_by)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-              [createId('payment'), user.market_id, user.branch_id, saleId, body.customer_id || null, paidMethod, paidIqd, user.id]
+              [createId('payment'), user.market_id, user.branch_id, saleId, body.customer_id || null, paidMethod, paidIqd, saleActorId]
             );
           }
           if (debt > 0) {
@@ -897,7 +897,7 @@ export function createHandler(pool, configInput = {}) {
           await client.query(
             `INSERT INTO journal_batches (id, market_id, branch_id, reference_type, reference_id, description, posted_by)
              VALUES ($1,$2,$3,'sale',$4,$5,$6)`,
-            [batchId, user.market_id, user.branch_id, saleId, `Sale ${receiptNumber}`, user.id]
+            [batchId, user.market_id, user.branch_id, saleId, `Sale ${receiptNumber}`, saleActorId]
           );
           const journal = [];
           if (paidIqd > 0) journal.push([paymentAccount(paidMethod), paidIqd, 0]);
