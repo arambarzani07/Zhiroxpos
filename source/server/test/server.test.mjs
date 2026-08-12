@@ -31,8 +31,10 @@ async function request(path, { method = 'GET', body, headers = {} } = {}) {
 
 before(async () => {
   const migration = await fs.readFile(new URL('../db/001_core.sql', import.meta.url), 'utf8');
+  const financial = await fs.readFile(new URL('../db/002_financial.sql', import.meta.url), 'utf8');
   await pool.query(migration);
-  await pool.query('TRUNCATE idempotency_keys, receipt_sequences, auth_throttle, sessions, users, branches, markets CASCADE');
+  await pool.query(financial);
+  await pool.query('TRUNCATE journal_lines, journal_batches, stock_movements, payments, sale_items, sales, customer_balances, customers, products, idempotency_keys, receipt_sequences, auth_throttle, sessions, users, branches, markets CASCADE');
   const handler = createHandler(pool, {
     production: false,
     bootstrapToken: 'integration-bootstrap-token',
@@ -139,4 +141,177 @@ test('logout revokes opaque session', async () => {
   assert.equal(logout.response.status, 200);
   const session = await request('/api/v1/session');
   assert.equal(session.response.status, 401);
+});
+
+
+test('authoritative sale commit updates stock, debt and balanced journal exactly once', async () => {
+  cookie = '';
+  const login = await request('/api/v1/login', { method: 'POST', body: { username: 'owner', password: 'SecurePass9' } });
+  assert.equal(login.response.status, 200);
+  const context = await pool.query('SELECT u.market_id, u.branch_id FROM users u WHERE u.username = $1', ['owner']);
+  const { market_id: marketId, branch_id: branchId } = context.rows[0];
+  await pool.query(
+    `INSERT INTO products (id, market_id, branch_id, barcode, name, cost_price_iqd, sale_price_iqd, stock_quantity)
+     VALUES ('prod-1',$1,$2,'1001','Water',400,1000,10), ('prod-2',$1,$2,'1002','Juice',700,1500,10)`,
+    [marketId, branchId]
+  );
+  await pool.query(
+    `INSERT INTO customers (id, market_id, code, name, debt_limit_iqd) VALUES ('cust-1',$1,'C001','Customer',10000)`,
+    [marketId]
+  );
+
+  const body = {
+    client_operation_id: 'device-A-sale-0001',
+    customer_id: 'cust-1',
+    payment_method: 'mixed',
+    paid_method: 'cash',
+    paid_iqd: 2000,
+    items: [{ product_id: 'prod-1', quantity: 2 }, { product_id: 'prod-2', quantity: 1 }],
+  };
+  const first = await request('/api/v1/sales/commit', { method: 'POST', headers: { 'idempotency-key': 'sale-key-0001' }, body });
+  assert.equal(first.response.status, 201);
+  assert.equal(first.json.total_iqd, 3500);
+  assert.equal(first.json.paid_iqd, 2000);
+  assert.equal(first.json.debt_iqd, 1500);
+
+  const retry = await request('/api/v1/sales/commit', { method: 'POST', headers: { 'idempotency-key': 'sale-key-0001' }, body });
+  assert.equal(retry.response.status, 200);
+  assert.equal(retry.json.sale_id, first.json.sale_id);
+  assert.equal(retry.json.receipt_number, first.json.receipt_number);
+
+  const changedChannel = await request('/api/v1/sales/commit', {
+    method: 'POST',
+    headers: { 'idempotency-key': 'sale-key-0001' },
+    body: { ...body, paid_method: 'bank' },
+  });
+  assert.equal(changedChannel.response.status, 409);
+  assert.equal(changedChannel.json.error, 'IDEMPOTENCY_CONFLICT');
+
+  const stock = await pool.query("SELECT id, stock_quantity FROM products WHERE id IN ('prod-1','prod-2') ORDER BY id");
+  assert.deepEqual(stock.rows.map(row => [row.id, Number(row.stock_quantity)]), [['prod-1', 8], ['prod-2', 9]]);
+  const balance = await pool.query("SELECT balance_iqd FROM customer_balances WHERE customer_id = 'cust-1'");
+  assert.equal(Number(balance.rows[0].balance_iqd), 1500);
+  const saleCount = await pool.query("SELECT count(*)::int AS count FROM sales WHERE client_operation_id = 'device-A-sale-0001'");
+  assert.equal(saleCount.rows[0].count, 1);
+  const journal = await pool.query(
+    `SELECT COALESCE(sum(jl.debit_iqd),0)::bigint AS debit, COALESCE(sum(jl.credit_iqd),0)::bigint AS credit
+       FROM journal_lines jl JOIN journal_batches jb ON jb.id = jl.batch_id WHERE jb.reference_id = $1`,
+    [first.json.sale_id]
+  );
+  assert.equal(Number(journal.rows[0].debit), Number(journal.rows[0].credit));
+});
+
+test('concurrent cashiers cannot oversell the same locked stock', async () => {
+  const before = await pool.query("SELECT stock_quantity FROM products WHERE id = 'prod-2'");
+  await pool.query("UPDATE products SET stock_quantity = 1 WHERE id = 'prod-2'");
+  const make = index => request('/api/v1/sales/commit', {
+    method: 'POST',
+    headers: { 'idempotency-key': `oversell-key-${index}` },
+    body: {
+      client_operation_id: `oversell-operation-${index}`,
+      payment_method: 'cash',
+      paid_iqd: 1500,
+      items: [{ product_id: 'prod-2', quantity: 1 }],
+    },
+  });
+  const results = await Promise.all([make(1), make(2)]);
+  assert.deepEqual(results.map(result => result.response.status).sort(), [201, 409]);
+  const after = await pool.query("SELECT stock_quantity FROM products WHERE id = 'prod-2'");
+  assert.equal(Number(after.rows[0].stock_quantity), 0);
+  await pool.query('UPDATE products SET stock_quantity = $1 WHERE id = $2', [before.rows[0].stock_quantity, 'prod-2']);
+});
+
+test('debt sale is rejected before mutation when customer credit limit would be exceeded', async () => {
+  await pool.query("UPDATE customers SET debt_limit_iqd = 1000 WHERE id = 'cust-1'");
+  const stockBefore = await pool.query("SELECT stock_quantity FROM products WHERE id = 'prod-1'");
+  const result = await request('/api/v1/sales/commit', {
+    method: 'POST',
+    headers: { 'idempotency-key': 'credit-limit-key-1' },
+    body: {
+      client_operation_id: 'credit-limit-operation-1',
+      customer_id: 'cust-1',
+      payment_method: 'debt',
+      paid_iqd: 0,
+      items: [{ product_id: 'prod-1', quantity: 1 }],
+    },
+  });
+  assert.equal(result.response.status, 409);
+  assert.equal(result.json.error, 'CREDIT_LIMIT_EXCEEDED');
+  const stockAfter = await pool.query("SELECT stock_quantity FROM products WHERE id = 'prod-1'");
+  assert.equal(Number(stockAfter.rows[0].stock_quantity), Number(stockBefore.rows[0].stock_quantity));
+});
+
+
+test('concurrent debt sales serialize credit limit checks', async () => {
+  const context = await pool.query('SELECT market_id, branch_id FROM users WHERE username = $1', ['owner']);
+  const { market_id: marketId, branch_id: branchId } = context.rows[0];
+  await pool.query(
+    `INSERT INTO products (id, market_id, branch_id, barcode, name, cost_price_iqd, sale_price_iqd, stock_quantity)
+     VALUES ('prod-debt-race',$1,$2,'1999','Debt Race Product',300,1000,3)
+     ON CONFLICT (id) DO UPDATE SET stock_quantity = 3, sale_price_iqd = 1000`,
+    [marketId, branchId]
+  );
+  await pool.query("UPDATE customers SET debt_limit_iqd = 1500 WHERE id = 'cust-1'");
+  await pool.query(
+    `INSERT INTO customer_balances (market_id, customer_id, balance_iqd, updated_at)
+     VALUES ($1,'cust-1',0,now())
+     ON CONFLICT (market_id, customer_id) DO UPDATE SET balance_iqd = 0, updated_at = now()`,
+    [marketId]
+  );
+
+  const make = index => request('/api/v1/sales/commit', {
+    method: 'POST',
+    headers: { 'idempotency-key': `debt-race-key-${index}` },
+    body: {
+      client_operation_id: `debt-race-operation-${index}`,
+      customer_id: 'cust-1',
+      payment_method: 'debt',
+      paid_iqd: 0,
+      items: [{ product_id: 'prod-debt-race', quantity: 1 }],
+    },
+  });
+  const results = await Promise.all([make(1), make(2)]);
+  assert.deepEqual(results.map(result => result.response.status).sort(), [201, 409]);
+  const rejected = results.find(result => result.response.status === 409);
+  assert.equal(rejected.json.error, 'CREDIT_LIMIT_EXCEEDED');
+
+  const balance = await pool.query("SELECT balance_iqd FROM customer_balances WHERE customer_id = 'cust-1'");
+  assert.equal(Number(balance.rows[0].balance_iqd), 1000);
+  const stock = await pool.query("SELECT stock_quantity FROM products WHERE id = 'prod-debt-race'");
+  assert.equal(Number(stock.rows[0].stock_quantity), 2);
+  const saleCount = await pool.query("SELECT count(*)::int AS count FROM sales WHERE client_operation_id LIKE 'debt-race-operation-%'");
+  assert.equal(saleCount.rows[0].count, 1);
+});
+
+
+test('concurrent identical idempotency retries commit exactly once', async () => {
+  const context = await pool.query('SELECT market_id, branch_id FROM users WHERE username = $1', ['owner']);
+  const { market_id: marketId, branch_id: branchId } = context.rows[0];
+  await pool.query(
+    `INSERT INTO products (id, market_id, branch_id, barcode, name, cost_price_iqd, sale_price_iqd, stock_quantity)
+     VALUES ('prod-idem-race',$1,$2,'1888','Idempotency Race Product',300,900,2)
+     ON CONFLICT (id) DO UPDATE SET stock_quantity = 2, sale_price_iqd = 900`,
+    [marketId, branchId]
+  );
+
+  const body = {
+    client_operation_id: 'idem-race-operation-1',
+    payment_method: 'cash',
+    paid_iqd: 900,
+    items: [{ product_id: 'prod-idem-race', quantity: 1 }],
+  };
+  const make = () => request('/api/v1/sales/commit', {
+    method: 'POST',
+    headers: { 'idempotency-key': 'idem-race-key-1' },
+    body,
+  });
+  const results = await Promise.all([make(), make()]);
+  assert.deepEqual(results.map(result => result.response.status).sort(), [200, 201]);
+  assert.equal(results[0].json.sale_id, results[1].json.sale_id);
+  assert.equal(results[0].json.receipt_number, results[1].json.receipt_number);
+
+  const stock = await pool.query("SELECT stock_quantity FROM products WHERE id = 'prod-idem-race'");
+  assert.equal(Number(stock.rows[0].stock_quantity), 1);
+  const sales = await pool.query("SELECT count(*)::int AS count FROM sales WHERE client_operation_id = 'idem-race-operation-1'");
+  assert.equal(sales.rows[0].count, 1);
 });

@@ -60,6 +60,47 @@ const businessDate = timeZone => {
 
 const validDate = value => /^\d{4}-\d{2}-\d{2}$/.test(String(value ?? ''));
 const validPrefix = value => /^[A-Z0-9]{2,8}$/.test(String(value ?? ''));
+const validOperationId = value => /^[A-Za-z0-9._:-]{8,128}$/.test(String(value ?? ''));
+const validPaymentMethod = value => ['cash', 'card', 'bank', 'debt', 'mixed'].includes(String(value ?? ''));
+
+const stableSaleHash = body => sha256(JSON.stringify({
+  client_operation_id: body.client_operation_id,
+  customer_id: body.customer_id || null,
+  payment_method: body.payment_method,
+  paid_method: body.paid_method || null,
+  paid_iqd: body.paid_iqd,
+  discount_iqd: body.discount_iqd || 0,
+  items: [...body.items].map(item => ({ product_id: item.product_id, quantity: Number(item.quantity) })).sort((a, b) => a.product_id.localeCompare(b.product_id)),
+}));
+
+async function nextReceipt(client, user, date) {
+  const branch = await client.query(
+    'SELECT receipt_prefix FROM branches WHERE id = $1 AND market_id = $2 AND status = $3',
+    [user.branch_id, user.market_id, 'active']
+  );
+  if (!branch.rows[0]) throw Object.assign(new Error('BRANCH_UNAVAILABLE'), { status: 409 });
+  const sequence = await client.query(
+    `INSERT INTO receipt_sequences (market_id, branch_id, business_date, last_value)
+     VALUES ($1, $2, $3::date, 1)
+     ON CONFLICT (market_id, branch_id, business_date)
+     DO UPDATE SET last_value = receipt_sequences.last_value + 1
+     RETURNING last_value`,
+    [user.market_id, user.branch_id, date]
+  );
+  const number = Number(sequence.rows[0].last_value);
+  return {
+    sequence: number,
+    receiptNumber: `${branch.rows[0].receipt_prefix}-${date.replaceAll('-', '')}-${String(number).padStart(6, '0')}`,
+  };
+}
+
+function paymentAccount(method) {
+  if (method === 'cash') return '1100-CASH';
+  if (method === 'card') return '1110-CARD-CLEARING';
+  if (method === 'bank') return '1120-BANK';
+  return null;
+}
+
 
 const requestIp = (req, trustProxy) => {
   if (trustProxy) {
@@ -313,6 +354,205 @@ export function createHandler(pool, configInput = {}) {
           await pool.query('UPDATE sessions SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL', [sha256(cookies.zhirox_session)]);
         }
         return json(res, 200, { ok: true }, { 'set-cookie': clearSessionCookie({ production: config.production }) });
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/v1/sales/commit') {
+        const user = await authenticate(pool, req);
+        if (!user) return json(res, 401, { error: 'AUTH_REQUIRED' });
+        if (!['owner', 'admin', 'cashier'].includes(user.role_type)) return json(res, 403, { error: 'PERMISSION_DENIED' });
+        if (!user.branch_id) return json(res, 409, { error: 'BRANCH_REQUIRED' });
+
+        const idempotencyKey = String(req.headers['idempotency-key'] ?? '').trim();
+        if (!idempotencyKey || idempotencyKey.length > 128) return json(res, 400, { error: 'IDEMPOTENCY_KEY_REQUIRED' });
+        const body = await readJson(req);
+        if (!validOperationId(body.client_operation_id) || !validPaymentMethod(body.payment_method) || !Array.isArray(body.items) || body.items.length < 1 || body.items.length > 250) {
+          return json(res, 422, { error: 'INVALID_SALE_REQUEST' });
+        }
+        if (body.payment_method === 'debt' && Number(body.paid_iqd || 0) !== 0) return json(res, 422, { error: 'INVALID_PAYMENT_SPLIT' });
+        const paidIqd = Number(body.paid_iqd || 0);
+        const discountIqd = Number(body.discount_iqd || 0);
+        if (!Number.isSafeInteger(paidIqd) || paidIqd < 0 || !Number.isSafeInteger(discountIqd) || discountIqd < 0) return json(res, 422, { error: 'INVALID_MONEY' });
+        if (discountIqd > 0 && !['owner', 'admin'].includes(user.role_type)) return json(res, 403, { error: 'DISCOUNT_REQUIRES_APPROVAL' });
+
+        const normalizedItems = body.items.map(item => ({ product_id: String(item.product_id || ''), quantity: Number(item.quantity) }));
+        if (normalizedItems.some(item => !item.product_id || !Number.isFinite(item.quantity) || item.quantity <= 0 || item.quantity > 1_000_000 || Math.round(item.quantity * 1000) !== item.quantity * 1000)) {
+          return json(res, 422, { error: 'INVALID_ITEM_QUANTITY' });
+        }
+        const requestHash = stableSaleHash({ ...body, items: normalizedItems, paid_iqd: paidIqd, discount_iqd: discountIqd });
+        const date = businessDate(config.timeZone);
+
+        const result = await withTransaction(pool, async client => {
+          await client.query(
+            'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+            [JSON.stringify([user.market_id, 'sale.commit', idempotencyKey])]
+          );
+          const existing = await client.query(
+            `SELECT request_hash, response_json FROM idempotency_keys
+              WHERE market_id = $1 AND scope = 'sale.commit' AND idempotency_key = $2
+              FOR UPDATE`,
+            [user.market_id, idempotencyKey]
+          );
+          if (existing.rows[0]) {
+            if (existing.rows[0].request_hash !== requestHash) return { status: 409, body: { error: 'IDEMPOTENCY_CONFLICT' } };
+            return { status: 200, body: existing.rows[0].response_json };
+          }
+
+          const operation = await client.query(
+            'SELECT receipt_number, total_iqd, paid_iqd, debt_iqd FROM sales WHERE market_id = $1 AND client_operation_id = $2',
+            [user.market_id, body.client_operation_id]
+          );
+          if (operation.rows[0]) return { status: 409, body: { error: 'CLIENT_OPERATION_ALREADY_USED' } };
+
+          const itemByProduct = new Map();
+          for (const item of normalizedItems) itemByProduct.set(item.product_id, (itemByProduct.get(item.product_id) || 0) + item.quantity);
+          const productIds = [...itemByProduct.keys()].sort();
+          const locked = await client.query(
+            `SELECT id, barcode, name, cost_price_iqd, sale_price_iqd, stock_quantity
+               FROM products
+              WHERE market_id = $1 AND branch_id = $2 AND status = 'active' AND id = ANY($3::text[])
+              ORDER BY id
+              FOR UPDATE`,
+            [user.market_id, user.branch_id, productIds]
+          );
+          if (locked.rows.length !== productIds.length) return { status: 409, body: { error: 'PRODUCT_UNAVAILABLE' } };
+
+          let subtotal = 0;
+          let cogs = 0;
+          const lines = [];
+          for (const product of locked.rows) {
+            const quantity = itemByProduct.get(product.id);
+            const stockBefore = Number(product.stock_quantity);
+            if (stockBefore + 1e-9 < quantity) return { status: 409, body: { error: 'STOCK_INSUFFICIENT', product_id: product.id, available: stockBefore } };
+            const lineTotal = Math.round(Number(product.sale_price_iqd) * quantity);
+            const lineCost = Math.round(Number(product.cost_price_iqd) * quantity);
+            subtotal += lineTotal;
+            cogs += lineCost;
+            lines.push({ product, quantity, stockBefore, stockAfter: stockBefore - quantity, lineTotal, lineCost });
+          }
+
+          if (discountIqd > subtotal) return { status: 422, body: { error: 'DISCOUNT_EXCEEDS_SUBTOTAL' } };
+          const total = subtotal - discountIqd;
+          if (paidIqd > total) return { status: 422, body: { error: 'PAID_EXCEEDS_TOTAL' } };
+          const debt = total - paidIqd;
+          if (debt > 0 && !body.customer_id) return { status: 422, body: { error: 'CUSTOMER_REQUIRED_FOR_DEBT' } };
+          if (body.payment_method === 'cash' || body.payment_method === 'card' || body.payment_method === 'bank') {
+            if (debt !== 0) return { status: 422, body: { error: 'PAYMENT_METHOD_REQUIRES_FULL_PAYMENT' } };
+          }
+          if (body.payment_method === 'mixed' && (paidIqd <= 0 || debt <= 0)) return { status: 422, body: { error: 'INVALID_PAYMENT_SPLIT' } };
+
+          let customer = null;
+          let balanceBefore = 0;
+          if (body.customer_id) {
+            const customerResult = await client.query(
+              `SELECT id, debt_limit_iqd, status
+                 FROM customers
+                WHERE id = $1 AND market_id = $2
+                FOR UPDATE`,
+              [String(body.customer_id), user.market_id]
+            );
+            customer = customerResult.rows[0];
+            if (!customer || customer.status !== 'active') return { status: 409, body: { error: 'CUSTOMER_UNAVAILABLE' } };
+
+            await client.query(
+              `INSERT INTO customer_balances (market_id, customer_id, balance_iqd, updated_at)
+               VALUES ($1,$2,0,now())
+               ON CONFLICT (market_id, customer_id) DO NOTHING`,
+              [user.market_id, String(body.customer_id)]
+            );
+            const balanceResult = await client.query(
+              `SELECT balance_iqd
+                 FROM customer_balances
+                WHERE market_id = $1 AND customer_id = $2
+                FOR UPDATE`,
+              [user.market_id, String(body.customer_id)]
+            );
+            balanceBefore = Number(balanceResult.rows[0]?.balance_iqd || 0);
+            if (debt > 0 && customer.debt_limit_iqd !== null && balanceBefore + debt > Number(customer.debt_limit_iqd)) {
+              return { status: 409, body: { error: 'CREDIT_LIMIT_EXCEEDED', balance_iqd: balanceBefore, debt_limit_iqd: Number(customer.debt_limit_iqd) } };
+            }
+          }
+
+          const { receiptNumber } = await nextReceipt(client, user, date);
+          const saleId = createId('sale');
+          await client.query(
+            `INSERT INTO sales (id, market_id, branch_id, receipt_number, cashier_id, customer_id, client_operation_id, payment_method, subtotal_iqd, discount_iqd, total_iqd, paid_iqd, debt_iqd)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+            [saleId, user.market_id, user.branch_id, receiptNumber, user.id, body.customer_id || null, body.client_operation_id, body.payment_method, subtotal, discountIqd, total, paidIqd, debt]
+          );
+
+          for (const line of lines) {
+            const itemId = createId('sale-item');
+            await client.query(
+              `INSERT INTO sale_items (id, sale_id, product_id, product_name, barcode, quantity, unit_price_iqd, unit_cost_iqd, line_total_iqd)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+              [itemId, saleId, line.product.id, line.product.name, line.product.barcode, line.quantity, Number(line.product.sale_price_iqd), Number(line.product.cost_price_iqd), line.lineTotal]
+            );
+            await client.query('UPDATE products SET stock_quantity = $1, version = version + 1, updated_at = now() WHERE id = $2', [line.stockAfter, line.product.id]);
+            await client.query(
+              `INSERT INTO stock_movements (id, market_id, branch_id, product_id, movement_type, quantity_delta, stock_before, stock_after, reference_type, reference_id, created_by)
+               VALUES ($1,$2,$3,$4,'sale',$5,$6,$7,'sale',$8,$9)`,
+              [createId('stock'), user.market_id, user.branch_id, line.product.id, -line.quantity, line.stockBefore, line.stockAfter, saleId, user.id]
+            );
+          }
+
+          const paidMethod = body.payment_method === 'mixed' ? String(body.paid_method || 'cash') : body.payment_method;
+          if (paidIqd > 0) {
+            if (!['cash','card','bank'].includes(paidMethod)) return { status: 422, body: { error: 'INVALID_PAID_METHOD' } };
+            await client.query(
+              `INSERT INTO payments (id, market_id, branch_id, sale_id, customer_id, method, amount_iqd, received_by)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+              [createId('payment'), user.market_id, user.branch_id, saleId, body.customer_id || null, paidMethod, paidIqd, user.id]
+            );
+          }
+          if (debt > 0) {
+            await client.query(
+              `INSERT INTO customer_balances (market_id, customer_id, balance_iqd, updated_at)
+               VALUES ($1,$2,$3,now())
+               ON CONFLICT (market_id, customer_id) DO UPDATE SET balance_iqd = customer_balances.balance_iqd + EXCLUDED.balance_iqd, updated_at = now()`,
+              [user.market_id, body.customer_id, debt]
+            );
+          }
+
+          const batchId = createId('journal');
+          await client.query(
+            `INSERT INTO journal_batches (id, market_id, branch_id, reference_type, reference_id, description, posted_by)
+             VALUES ($1,$2,$3,'sale',$4,$5,$6)`,
+            [batchId, user.market_id, user.branch_id, saleId, `Sale ${receiptNumber}`, user.id]
+          );
+          const journal = [];
+          if (paidIqd > 0) journal.push([paymentAccount(paidMethod), paidIqd, 0]);
+          if (debt > 0) journal.push(['1200-ACCOUNTS-RECEIVABLE', debt, 0]);
+          journal.push(['4000-SALES-REVENUE', 0, total]);
+          if (cogs > 0) {
+            journal.push(['5000-COGS', cogs, 0]);
+            journal.push(['1300-INVENTORY', 0, cogs]);
+          }
+          const debits = journal.reduce((sum, line) => sum + line[1], 0);
+          const credits = journal.reduce((sum, line) => sum + line[2], 0);
+          if (debits !== credits) throw new Error(`UNBALANCED_JOURNAL:${debits}:${credits}`);
+          for (const [account, debit, credit] of journal) {
+            if (!account) throw new Error('JOURNAL_ACCOUNT_MISSING');
+            await client.query('INSERT INTO journal_lines (id, batch_id, account_code, debit_iqd, credit_iqd) VALUES ($1,$2,$3,$4,$5)', [createId('journal-line'), batchId, account, debit, credit]);
+          }
+
+          const response = {
+            sale_id: saleId,
+            receipt_number: receiptNumber,
+            subtotal_iqd: subtotal,
+            discount_iqd: discountIqd,
+            total_iqd: total,
+            paid_iqd: paidIqd,
+            debt_iqd: debt,
+            customer_balance_iqd: customer ? balanceBefore + debt : null,
+          };
+          await client.query(
+            `INSERT INTO idempotency_keys (market_id, scope, idempotency_key, request_hash, response_json, user_id)
+             VALUES ($1,'sale.commit',$2,$3,$4::jsonb,$5)`,
+            [user.market_id, idempotencyKey, requestHash, JSON.stringify(response), user.id]
+          );
+          return { status: 201, body: response };
+        });
+        return json(res, result.status, result.body);
       }
 
       if (req.method === 'POST' && url.pathname === '/api/v1/receipts/reserve') {
