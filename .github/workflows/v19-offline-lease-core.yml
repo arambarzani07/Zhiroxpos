@@ -1,0 +1,68 @@
+name: V19 Offline Writer Lease Core
+
+on:
+  push:
+    branches:
+      - v19-production-readiness
+    paths:
+      - 'tools/v19_add_offline_lease_core.py'
+      - '.github/workflows/v19-offline-lease-core.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  offline-lease:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: zhirox
+          POSTGRES_PASSWORD: zhirox_test_password
+          POSTGRES_DB: zhirox_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zhirox -d zhirox_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://zhirox:zhirox_test_password@127.0.0.1:5432/zhirox_test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v19-production-readiness
+      - name: Generate offline writer lease authority
+        run: python3 tools/v19_add_offline_lease_core.py
+      - name: Syntax-check server
+        working-directory: source/server
+        run: node --check src/app.mjs
+      - name: Install and audit server
+        working-directory: source/server
+        run: |
+          npm ci
+          npm audit --omit=dev --audit-level=high
+      - name: Run PostgreSQL lease, receipt-block, financial and race tests
+        working-directory: source/server
+        run: npm test
+      - name: Revalidate frontend production gates
+        working-directory: source
+        run: |
+          npm ci
+          npm run check:production
+          npx tsc --noEmit
+          npm run build
+      - name: Commit verified offline lease core
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add source/server
+          if git diff --cached --quiet; then
+            echo 'Offline lease core already committed.'
+            exit 0
+          fi
+          git commit -m 'Add single-writer offline lease and receipt blocks for v19'
+          git push origin HEAD:v19-production-readiness
