@@ -25,6 +25,7 @@ import { BarcodeGeneratorButton } from '../components/features/BarcodeGenerator'
 import { ProductDetailModal } from '../components/features/ProductDetail';
 import { cn } from '../utils/cn';
 import type { Product } from '../types';
+import { ApiError, serverApi } from '../services/serverApi';
 
 function formatCurrency(amount: number, currency: 'IQD' | 'USD' = 'IQD'): string {
   if (currency === 'USD') {
@@ -42,7 +43,7 @@ export function ProductsPage() {
   const [viewingProduct, setViewingProduct] = useState<Product | null>(null);
 
   const { hasPermission, user } = useAuthStore();
-  const { getProducts, getCategories, addProduct, updateProduct, getProductByBarcode, addAuditLog } = useDataStore();
+  const { getProducts, getCategories, getProductByBarcode, upsertAuthoritativeProduct } = useDataStore();
 
   const products = getProducts();
   const categories = getCategories();
@@ -56,80 +57,14 @@ export function ProductsPage() {
     return matchesSearch && matchesCategory && matchesLowStock;
   });
 
-  const handleSaveProduct = (productData: Partial<Product>) => {
-    if (!user?.market_id || !user.branch_id) {
-      toast.error('هەژماری فرۆشگا/لق دیاری نەکراوە');
-      return;
-    }
-    if (editingProduct) {
-      updateProduct(editingProduct.id, productData);
-      
-      if (user) {
-        addAuditLog({
-          market_id: user.market_id,
-          branch_id: user.branch_id,
-          user_id: user.id,
-          action: 'products.update',
-          module: 'products',
-          table_name: 'products',
-          record_id: editingProduct.id,
-          old_value: editingProduct as unknown as Record<string, unknown>,
-          new_value: { ...editingProduct, ...productData } as unknown as Record<string, unknown>,
-        });
-      }
-      
-      toast.success(translations.success.product_updated);
-      setEditingProduct(null);
-    } else {
-      // Check for duplicate barcode (primary + extras)
-      const barcodesToCheck = [productData.barcode, ...(productData.barcodes || [])].filter(Boolean) as string[];
-      for (const bc of barcodesToCheck) {
-        if (getProductByBarcode(bc)) {
-          toast.error(`${translations.errors.BARCODE_DUPLICATE}: ${bc}`);
-          return;
-        }
-      }
-
-      const primaryBarcode = productData.barcode || '';
-      const allBarcodes = productData.barcodes && productData.barcodes.length > 0
-        ? productData.barcodes : [primaryBarcode].filter(Boolean);
-
-      const newProduct = addProduct({
-        market_id: user.market_id,
-        branch_id: user.branch_id,
-        category_id: productData.category_id,
-        barcode: primaryBarcode,
-        barcodes: allBarcodes,
-        name: productData.name || '',
-        name_en: productData.name_en,
-        description: productData.description,
-        unit: productData.unit || 'دانە',
-        cost_price: productData.cost_price || 0,
-        sale_price: productData.sale_price || 0,
-        currency: 'IQD',
-        stock_quantity: productData.stock_quantity || 0,
-        low_stock_limit: productData.low_stock_limit || 10,
-        is_trackable: true,
-        status: 'active',
-        created_by: user.id,
-      });
-
-      if (user) {
-        addAuditLog({
-          market_id: user.market_id,
-          branch_id: user.branch_id,
-          user_id: user.id,
-          action: 'products.create',
-          module: 'products',
-          table_name: 'products',
-          record_id: newProduct.id,
-          new_value: newProduct as unknown as Record<string, unknown>,
-        });
-      }
-
-      toast.success(translations.success.product_created);
-      setShowAddModal(false);
-    }
+  const handleSaveProduct = async (productData: Partial<Product>) => {
+    if (!user?.market_id || !user.branch_id) { toast.error('هەژماری فرۆشگا/لق دیاری نەکراوە'); return; }
+    const primaryBarcode=productData.barcode||editingProduct?.barcode||'';
+    if(!editingProduct){ for(const bc of [primaryBarcode,...(productData.barcodes||[])].filter(Boolean) as string[]){if(getProductByBarcode(bc)){toast.error(`${translations.errors.BARCODE_DUPLICATE}: ${bc}`);return;}} }
+    try {
+      const {product}=await serverApi.saveProduct({id:editingProduct?.id,version:editingProduct?.version,category_id:productData.category_id,barcode:primaryBarcode,barcodes:productData.barcodes||editingProduct?.barcodes||[],name:productData.name||editingProduct?.name||'',name_en:productData.name_en,description:productData.description,unit:productData.unit||editingProduct?.unit||'دانە',cost_price_iqd:productData.cost_price??editingProduct?.cost_price??0,sale_price_iqd:productData.sale_price??editingProduct?.sale_price??0,currency:'IQD',stock_quantity:productData.stock_quantity??editingProduct?.stock_quantity??0,low_stock_limit:productData.low_stock_limit??editingProduct?.low_stock_limit??10,is_trackable:productData.is_trackable??editingProduct?.is_trackable??true,status:(productData.status||editingProduct?.status||'active') as 'active'|'inactive'});
+      upsertAuthoritativeProduct(product); toast.success(editingProduct?translations.success.product_updated:translations.success.product_created); setEditingProduct(null); setShowAddModal(false);
+    } catch(error){const code=error instanceof ApiError?error.code:'UNKNOWN_ERROR';toast.error(code==='VERSION_CONFLICT'?'کالاکە لە ئامێرێکی تر گۆڕاوە؛ پەڕەکە نوێ بکەرەوە':code==='BARCODE_DUPLICATE'?translations.errors.BARCODE_DUPLICATE:code);}
   };
 
   const categoryOptions = [
@@ -331,7 +266,7 @@ export function ProductsPage() {
         }}
         product={editingProduct}
         categories={categories}
-        onSave={handleSaveProduct}
+        onSave={(data) => void handleSaveProduct(data)}
         canChangePrice={hasPermission(PERMISSIONS.PRODUCTS_CHANGE_PRICE)}
       />
 

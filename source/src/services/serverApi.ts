@@ -69,6 +69,40 @@ async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
   return payload as T;
 }
 
+
+export interface ServerProduct {
+  id:string; market_id:string; branch_id:string; category_id?:string|null; barcode:string; barcodes:string[];
+  name:string; name_en?:string|null; description?:string|null; unit:string; cost_price_iqd:number; sale_price_iqd:number;
+  currency:'IQD'|'USD'; stock_quantity:number; low_stock_limit:number; image_url?:string|null; is_trackable:boolean;
+  status:'active'|'inactive'; version:number; created_at:string; updated_at:string;
+}
+export interface ServerCustomer {
+  id:string; market_id:string; code:string; name:string; phone?:string|null; address?:string|null; notes?:string|null;
+  debt_limit_iqd:number|null; balance_iqd:number; status:'active'|'blocked'; version:number; created_at:string; updated_at:string;
+}
+export interface ServerSaleCommit {
+  sale_id:string; receipt_number:string; payment_method:'cash'|'card'|'bank'|'debt'|'mixed'; paid_method:'cash'|'card'|'bank'|null;
+  customer_id:string|null; subtotal_iqd:number; discount_iqd:number; total_iqd:number; paid_iqd:number; debt_iqd:number;
+  customer_balance_iqd:number|null; items:Array<{product_id:string;product_name:string;barcode:string;quantity:number;unit_price_iqd:number;unit_cost_iqd:number;line_total_iqd:number;stock_after:number}>;
+}
+const operationId = (prefix:string) => {
+  const cryptoApi = globalThis.crypto;
+  if (!cryptoApi?.getRandomValues) throw new ApiError(0,'SECURE_RANDOM_UNAVAILABLE');
+  if (cryptoApi.randomUUID) return `${prefix}-${cryptoApi.randomUUID()}`;
+  const bytes=new Uint8Array(16); cryptoApi.getRandomValues(bytes);
+  return `${prefix}-${Array.from(bytes).map(v=>v.toString(16).padStart(2,'0')).join('')}`;
+};
+
+async function loadPages<T>(path:string):Promise<T[]> {
+  const all:T[]=[]; let after='';
+  do {
+    const query = new URLSearchParams({limit:'500'}); if(after)query.set('after_id',after);
+    const page=await apiFetch<{items:T[];next_after_id:string|null}>(`${path}?${query.toString()}`);
+    all.push(...page.items); after=page.next_after_id||'';
+  } while(after);
+  return all;
+}
+
 export const serverApi = {
   bootstrapStatus: () => apiFetch<{ needs_bootstrap: boolean }>('/api/v1/bootstrap/status'),
   session: () => apiFetch<ServerContext>('/api/v1/session'),
@@ -90,6 +124,19 @@ export const serverApi = {
       }),
     }),
   logout: () => apiFetch<{ ok: true }>('/api/v1/logout', { method: 'POST' }),
+  loadProducts: () => loadPages<ServerProduct>('/api/v1/catalog/products'),
+  loadCustomers: () => loadPages<ServerCustomer>('/api/v1/customers'),
+  saveProduct: (input: Partial<ServerProduct> & { barcode:string; name:string; cost_price_iqd:number; sale_price_iqd:number; stock_quantity:number; low_stock_limit:number }) => {
+    const key=operationId('product-save');
+    return apiFetch<{product:ServerProduct}>('/api/v1/catalog/products/save',{method:'POST',headers:{'idempotency-key':key},body:JSON.stringify(input)});
+  },
+  saveCustomer: (input: Partial<ServerCustomer> & { code:string; name:string }) => {
+    const key=operationId('customer-save');
+    return apiFetch<{customer:ServerCustomer}>('/api/v1/customers/save',{method:'POST',headers:{'idempotency-key':key},body:JSON.stringify(input)});
+  },
+  commitSale: (input:{client_operation_id:string;customer_id?:string;payment_method:'cash'|'card'|'bank'|'debt'|'mixed';paid_method?:'cash'|'card'|'bank';paid_iqd:number;discount_iqd:number;items:Array<{product_id:string;quantity:number}>}, idempotencyKey:string) =>
+    apiFetch<ServerSaleCommit>('/api/v1/sales/commit',{method:'POST',headers:{'idempotency-key':idempotencyKey},body:JSON.stringify(input)}),
+  createOperationId: operationId,
   reserveReceipt: (idempotencyKey: string, businessDate?: string) => apiFetch<{ receipt_number: string; sequence: number; business_date: string }>('/api/v1/receipts/reserve', {
     method: 'POST',
     headers: { 'idempotency-key': idempotencyKey },

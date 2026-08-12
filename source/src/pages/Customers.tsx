@@ -25,6 +25,7 @@ import { toast } from '../components/ui/Toast';
 import { CustomerDetailModal } from '../components/features/CustomerDetail';
 import { exportCustomersData } from '../components/features/DataExport';
 import type { Customer } from '../types';
+import { ApiError, serverApi } from '../services/serverApi';
 
 function formatCurrency(amount: number, currency: 'IQD' | 'USD' = 'IQD'): string {
   if (currency === 'USD') {
@@ -41,7 +42,7 @@ export function CustomersPage() {
   const [viewingCustomer, setViewingCustomer] = useState<Customer | null>(null);
 
   const { hasPermission, user } = useAuthStore();
-  const { getCustomers, getCustomerBalance, addCustomer, updateCustomer, addAuditLog } = useDataStore();
+  const { getCustomers, getCustomerBalance, upsertAuthoritativeCustomer } = useDataStore();
 
   const customers = getCustomers();
 
@@ -62,58 +63,12 @@ export function CustomersPage() {
     return matchesSearch;
   });
 
-  const handleSaveCustomer = (customerData: Partial<Customer>) => {
-    if (!user?.market_id || !user.branch_id) {
-      toast.error('هەژماری فرۆشگا/لق دیاری نەکراوە');
-      return;
-    }
-    if (editingCustomer) {
-      updateCustomer(editingCustomer.id, customerData);
-      
-      if (user) {
-        addAuditLog({
-          market_id: user.market_id,
-          branch_id: user.branch_id,
-          user_id: user.id,
-          action: 'customers.update',
-          module: 'customers',
-          table_name: 'customers',
-          record_id: editingCustomer.id,
-          old_value: editingCustomer as unknown as Record<string, unknown>,
-          new_value: { ...editingCustomer, ...customerData } as unknown as Record<string, unknown>,
-        });
-      }
-      
-      toast.success(translations.success.customer_updated);
-      setEditingCustomer(null);
-    } else {
-      const newCustomer = addCustomer({
-        market_id: user.market_id,
-        name: customerData.name || '',
-        phone: customerData.phone,
-        address: customerData.address,
-        notes: customerData.notes,
-        debt_limit: customerData.debt_limit,
-        status: 'active',
-        created_by: user.id,
-      });
-
-      if (user) {
-        addAuditLog({
-          market_id: user.market_id,
-          branch_id: user.branch_id,
-          user_id: user.id,
-          action: 'customers.create',
-          module: 'customers',
-          table_name: 'customers',
-          record_id: newCustomer.id,
-          new_value: newCustomer as unknown as Record<string, unknown>,
-        });
-      }
-
-      toast.success(translations.success.customer_created);
-      setShowAddModal(false);
-    }
+  const handleSaveCustomer = async (customerData: Partial<Customer>) => {
+    if (!user?.market_id || !user.branch_id) { toast.error('هەژماری فرۆشگا/لق دیاری نەکراوە'); return; }
+    try {
+      const {customer}=await serverApi.saveCustomer({id:editingCustomer?.id,version:editingCustomer?.version,code:editingCustomer?.code||`C-${Date.now()}`,name:customerData.name||editingCustomer?.name||'',phone:customerData.phone,address:customerData.address,notes:customerData.notes,debt_limit_iqd:customerData.debt_limit??editingCustomer?.debt_limit??null,status:(customerData.status||editingCustomer?.status||'active') as 'active'|'blocked'});
+      upsertAuthoritativeCustomer(customer); toast.success(editingCustomer?translations.success.customer_updated:translations.success.customer_created); setEditingCustomer(null); setShowAddModal(false);
+    } catch(error){const code=error instanceof ApiError?error.code:'UNKNOWN_ERROR';toast.error(code==='VERSION_CONFLICT'?'کڕیارەکە لە ئامێرێکی تر گۆڕاوە؛ پەڕەکە نوێ بکەرەوە':code==='CUSTOMER_CODE_DUPLICATE'?'کۆدی کڕیار دووبارەیە':code);}
   };
 
   const debtFilterOptions = [
@@ -324,7 +279,7 @@ export function CustomersPage() {
           setEditingCustomer(null);
         }}
         customer={editingCustomer}
-        onSave={handleSaveCustomer}
+        onSave={(data) => void handleSaveCustomer(data)}
       />
 
       <CustomerDetailModal

@@ -33,9 +33,11 @@ before(async () => {
   const migration = await fs.readFile(new URL('../db/001_core.sql', import.meta.url), 'utf8');
   const financial = await fs.readFile(new URL('../db/002_financial.sql', import.meta.url), 'utf8');
   const catalog = await fs.readFile(new URL('../db/003_catalog.sql', import.meta.url), 'utf8');
+  const dailyAuthority = await fs.readFile(new URL('../db/004_daily_authority.sql', import.meta.url), 'utf8');
   await pool.query(migration);
   await pool.query(financial);
   await pool.query(catalog);
+  await pool.query(dailyAuthority);
   await pool.query('TRUNCATE journal_lines, journal_batches, stock_movements, payments, sale_items, sales, customer_balances, customers, products, idempotency_keys, receipt_sequences, auth_throttle, sessions, users, branches, markets CASCADE');
   const handler = createHandler(pool, {
     production: false,
@@ -356,4 +358,32 @@ test('customer import creates authoritative opening balance and ignores injected
   const list = await request('/api/v1/customers?limit=500');
   assert.equal(list.response.status,200);
   assert.ok(list.json.items.some(item => item.code === 'C-IMPORT-1' && item.balance_iqd === 1250));
+});
+
+
+test('product save rejects stale optimistic version and tenant injection', async () => {
+  const create=await request('/api/v1/catalog/products/save',{method:'POST',headers:{'idempotency-key':'prod-save-create-1'},body:{market_id:'evil',branch_id:'evil',barcode:'SAVE-001',name:'Saved Product',cost_price_iqd:100,sale_price_iqd:250,stock_quantity:4,low_stock_limit:1}});
+  assert.equal(create.response.status,201); const p=create.json.product; assert.equal(p.version,1);
+  const context=await pool.query('SELECT market_id,branch_id FROM users WHERE username=$1',['owner']);
+  assert.equal(p.market_id,context.rows[0].market_id); assert.equal(p.branch_id,context.rows[0].branch_id);
+  const edit=await request('/api/v1/catalog/products/save',{method:'POST',headers:{'idempotency-key':'prod-save-edit-1'},body:{id:p.id,version:1,barcode:'SAVE-001',name:'Saved Product v2',cost_price_iqd:100,sale_price_iqd:300,stock_quantity:4,low_stock_limit:1}});
+  assert.equal(edit.response.status,200); assert.equal(edit.json.product.version,2);
+  const stale=await request('/api/v1/catalog/products/save',{method:'POST',headers:{'idempotency-key':'prod-save-stale-1'},body:{id:p.id,version:1,barcode:'SAVE-001',name:'stale',cost_price_iqd:100,sale_price_iqd:999,stock_quantity:4,low_stock_limit:1}});
+  assert.equal(stale.response.status,409); assert.equal(stale.json.error,'VERSION_CONFLICT');
+});
+
+test('customer save rejects stale optimistic version', async () => {
+  const create=await request('/api/v1/customers/save',{method:'POST',headers:{'idempotency-key':'cust-save-create-1'},body:{code:'SAVE-C-1',name:'Saved Customer',debt_limit_iqd:5000}});
+  assert.equal(create.response.status,201); const c=create.json.customer; assert.equal(c.version,1);
+  const edit=await request('/api/v1/customers/save',{method:'POST',headers:{'idempotency-key':'cust-save-edit-1'},body:{id:c.id,version:1,code:'SAVE-C-1',name:'Saved Customer v2',debt_limit_iqd:6000}});
+  assert.equal(edit.response.status,200); assert.equal(edit.json.customer.version,2);
+  const stale=await request('/api/v1/customers/save',{method:'POST',headers:{'idempotency-key':'cust-save-stale-1'},body:{id:c.id,version:1,code:'SAVE-C-1',name:'stale',debt_limit_iqd:9000}});
+  assert.equal(stale.response.status,409); assert.equal(stale.json.error,'VERSION_CONFLICT');
+});
+
+test('sale response contains authoritative item pricing and stock-after', async () => {
+  const context=await pool.query('SELECT market_id,branch_id FROM users WHERE username=$1',['owner']); const {market_id:marketId,branch_id:branchId}=context.rows[0];
+  await pool.query(`INSERT INTO products (id,market_id,branch_id,barcode,name,cost_price_iqd,sale_price_iqd,stock_quantity) VALUES ('prod-response',$1,$2,'RESP-1','Response Product',300,777,5) ON CONFLICT (id) DO UPDATE SET sale_price_iqd=777,stock_quantity=5`,[marketId,branchId]);
+  const sale=await request('/api/v1/sales/commit',{method:'POST',headers:{'idempotency-key':'response-sale-key'},body:{client_operation_id:'response-sale-operation',payment_method:'cash',paid_iqd:1554,items:[{product_id:'prod-response',quantity:2}]}});
+  assert.equal(sale.response.status,201); assert.equal(sale.json.items[0].unit_price_iqd,777); assert.equal(sale.json.items[0].line_total_iqd,1554); assert.equal(sale.json.items[0].stock_after,3);
 });

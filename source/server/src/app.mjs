@@ -366,6 +366,116 @@ export function createHandler(pool, configInput = {}) {
         return json(res, 200, { ok: true }, { 'set-cookie': clearSessionCookie({ production: config.production }) });
       }
 
+      if (req.method === 'POST' && url.pathname === '/api/v1/catalog/products/save') {
+        const user = await authenticate(pool, req);
+        if (!user) return json(res, 401, { error: 'AUTH_REQUIRED' });
+        if (!['owner','admin','stock_staff'].includes(user.role_type)) return json(res, 403, { error: 'PERMISSION_DENIED' });
+        if (!user.branch_id) return json(res, 409, { error: 'BRANCH_REQUIRED' });
+        const key = String(req.headers['idempotency-key'] || '').trim();
+        if (!key || key.length > 128) return json(res, 400, { error: 'IDEMPOTENCY_KEY_REQUIRED' });
+        const body = await readJson(req);
+        const id = body.id ? String(body.id) : null;
+        const barcode = String(body.barcode || '').trim();
+        const name = String(body.name || '').trim();
+        const expectedVersion = id ? Number(body.version) : null;
+        if ((id && (!validEntityId(id) || !Number.isSafeInteger(expectedVersion) || expectedVersion < 1)) || !validBarcode(barcode) || !name || name.length > 300 || !safeMoney(body.cost_price_iqd) || !safeMoney(body.sale_price_iqd) || !safeStock(body.stock_quantity || 0) || !safeStock(body.low_stock_limit || 0)) {
+          return json(res, 422, { error: 'INVALID_PRODUCT' });
+        }
+        const normalized = {
+          id, barcode, name, name_en: body.name_en ? String(body.name_en).slice(0,300) : null,
+          description: body.description ? String(body.description).slice(0,2000) : null,
+          unit: String(body.unit || 'دانە').slice(0,50), cost: Number(body.cost_price_iqd), sale: Number(body.sale_price_iqd),
+          stock: Number(body.stock_quantity || 0), low: Number(body.low_stock_limit || 0), currency: body.currency === 'USD' ? 'USD' : 'IQD',
+          is_trackable: body.is_trackable !== false, status: body.status === 'inactive' ? 'inactive' : 'active',
+          image_url: body.image_url ? String(body.image_url).slice(0,2000) : null,
+          barcodes: Array.isArray(body.barcodes) ? [...new Set(body.barcodes.map(value => String(value).trim()).filter(value => validBarcode(value) && value !== barcode))].slice(0,20) : [],
+          category_id: body.category_id && validEntityId(body.category_id) ? String(body.category_id) : null,
+          version: expectedVersion,
+        };
+        const requestHash = sha256(JSON.stringify(normalized));
+        const result = await withTransaction(pool, async client => {
+          await lockIdempotency(client, user.market_id, 'products.save', key);
+          const existing = await client.query(`SELECT request_hash,response_json FROM idempotency_keys WHERE market_id=$1 AND scope='products.save' AND idempotency_key=$2`, [user.market_id,key]);
+          if (existing.rows[0]) {
+            if (existing.rows[0].request_hash !== requestHash) return { status:409, body:{error:'IDEMPOTENCY_CONFLICT'} };
+            return { status:200, body:existing.rows[0].response_json };
+          }
+          const barcodeConflict = await client.query('SELECT id FROM products WHERE market_id=$1 AND barcode=$2 AND ($3::text IS NULL OR id<>$3) LIMIT 1', [user.market_id,barcode,id]);
+          if (barcodeConflict.rows[0]) return { status:409, body:{error:'BARCODE_DUPLICATE'} };
+          let saved;
+          if (!id) {
+            saved = await client.query(
+              `INSERT INTO products (id,market_id,branch_id,category_id,barcode,barcodes,name,name_en,description,unit,cost_price_iqd,sale_price_iqd,currency,stock_quantity,low_stock_limit,image_url,is_trackable,status,created_by)
+               VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+               RETURNING *`,
+              [createId('product'),user.market_id,user.branch_id,normalized.category_id,barcode,JSON.stringify(normalized.barcodes),name,normalized.name_en,normalized.description,normalized.unit,normalized.cost,normalized.sale,normalized.currency,normalized.stock,normalized.low,normalized.image_url,normalized.is_trackable,normalized.status,user.id]
+            );
+          } else {
+            const before = await client.query('SELECT stock_quantity FROM products WHERE id=$1 AND market_id=$2 AND branch_id=$3 FOR UPDATE', [id,user.market_id,user.branch_id]);
+            if (!before.rows[0]) return { status:404, body:{error:'PRODUCT_NOT_FOUND'} };
+            saved = await client.query(
+              `UPDATE products SET category_id=$1,barcode=$2,barcodes=$3::jsonb,name=$4,name_en=$5,description=$6,unit=$7,cost_price_iqd=$8,sale_price_iqd=$9,currency=$10,stock_quantity=$11,low_stock_limit=$12,image_url=$13,is_trackable=$14,status=$15,version=version+1,updated_at=now()
+                WHERE id=$16 AND market_id=$17 AND branch_id=$18 AND version=$19
+                RETURNING *`,
+              [normalized.category_id,barcode,JSON.stringify(normalized.barcodes),name,normalized.name_en,normalized.description,normalized.unit,normalized.cost,normalized.sale,normalized.currency,normalized.stock,normalized.low,normalized.image_url,normalized.is_trackable,normalized.status,id,user.market_id,user.branch_id,expectedVersion]
+            );
+            if (saved.rows[0] && Number(before.rows[0].stock_quantity) !== normalized.stock) {
+              await client.query(
+                `INSERT INTO stock_movements (id,market_id,branch_id,product_id,movement_type,quantity_delta,stock_before,stock_after,reference_type,reference_id,created_by)
+                 VALUES ($1,$2,$3,$4,'adjustment',$5,$6,$7,'product.save',$8,$9)`,
+                [createId('stock'),user.market_id,user.branch_id,id,normalized.stock-Number(before.rows[0].stock_quantity),Number(before.rows[0].stock_quantity),normalized.stock,key,user.id]
+              );
+            }
+            if (!saved.rows[0]) {
+              const current = await client.query('SELECT version FROM products WHERE id=$1 AND market_id=$2 AND branch_id=$3', [id,user.market_id,user.branch_id]);
+              return current.rows[0] ? { status:409, body:{error:'VERSION_CONFLICT', current_version:Number(current.rows[0].version)} } : { status:404, body:{error:'PRODUCT_NOT_FOUND'} };
+            }
+          }
+          const row = saved.rows[0];
+          const payload = { product:{...row,cost_price_iqd:Number(row.cost_price_iqd),sale_price_iqd:Number(row.sale_price_iqd),stock_quantity:Number(row.stock_quantity),low_stock_limit:Number(row.low_stock_limit),version:Number(row.version)} };
+          await client.query(`INSERT INTO idempotency_keys (market_id,scope,idempotency_key,request_hash,response_json,user_id) VALUES ($1,'products.save',$2,$3,$4::jsonb,$5)`, [user.market_id,key,requestHash,JSON.stringify(payload),user.id]);
+          return { status:id?200:201, body:payload };
+        });
+        return json(res,result.status,result.body);
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/v1/customers/save') {
+        const user = await authenticate(pool, req);
+        if (!user) return json(res,401,{error:'AUTH_REQUIRED'});
+        if (!['owner','admin'].includes(user.role_type)) return json(res,403,{error:'PERMISSION_DENIED'});
+        const key = String(req.headers['idempotency-key'] || '').trim();
+        if (!key || key.length > 128) return json(res,400,{error:'IDEMPOTENCY_KEY_REQUIRED'});
+        const body = await readJson(req);
+        const id = body.id ? String(body.id) : null;
+        const name = String(body.name || '').trim();
+        const code = String(body.code || '').trim();
+        const version = id ? Number(body.version) : null;
+        const debtLimit = body.debt_limit_iqd === null || body.debt_limit_iqd === undefined || body.debt_limit_iqd === '' ? null : Number(body.debt_limit_iqd);
+        if ((id && (!validEntityId(id) || !Number.isSafeInteger(version) || version < 1)) || !name || name.length>300 || !code || code.length>64 || (debtLimit!==null && (!Number.isSafeInteger(debtLimit)||debtLimit<0))) return json(res,422,{error:'INVALID_CUSTOMER'});
+        const normalized = { id,name,code,phone:body.phone?String(body.phone).slice(0,100):null,address:body.address?String(body.address).slice(0,1000):null,notes:body.notes?String(body.notes).slice(0,2000):null,debt_limit_iqd:debtLimit,status:body.status==='blocked'?'blocked':'active',version };
+        const requestHash = sha256(JSON.stringify(normalized));
+        const result = await withTransaction(pool,async client=>{
+          await lockIdempotency(client,user.market_id,'customers.save',key);
+          const existing=await client.query(`SELECT request_hash,response_json FROM idempotency_keys WHERE market_id=$1 AND scope='customers.save' AND idempotency_key=$2`,[user.market_id,key]);
+          if(existing.rows[0]){ if(existing.rows[0].request_hash!==requestHash)return {status:409,body:{error:'IDEMPOTENCY_CONFLICT'}}; return {status:200,body:existing.rows[0].response_json}; }
+          const codeConflict=await client.query('SELECT id FROM customers WHERE market_id=$1 AND code=$2 AND ($3::text IS NULL OR id<>$3) LIMIT 1',[user.market_id,code,id]);
+          if(codeConflict.rows[0])return {status:409,body:{error:'CUSTOMER_CODE_DUPLICATE'}};
+          let saved;
+          if(!id){
+            saved=await client.query(`INSERT INTO customers (id,market_id,code,name,phone,address,notes,debt_limit_iqd,status,created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,[createId('customer'),user.market_id,code,name,normalized.phone,normalized.address,normalized.notes,debtLimit,normalized.status,user.id]);
+          } else {
+            saved=await client.query(`UPDATE customers SET code=$1,name=$2,phone=$3,address=$4,notes=$5,debt_limit_iqd=$6,status=$7,version=version+1,updated_at=now() WHERE id=$8 AND market_id=$9 AND version=$10 RETURNING *`,[code,name,normalized.phone,normalized.address,normalized.notes,debtLimit,normalized.status,id,user.market_id,version]);
+            if(!saved.rows[0]){ const current=await client.query('SELECT version FROM customers WHERE id=$1 AND market_id=$2',[id,user.market_id]); return current.rows[0]?{status:409,body:{error:'VERSION_CONFLICT',current_version:Number(current.rows[0].version)}}:{status:404,body:{error:'CUSTOMER_NOT_FOUND'}}; }
+          }
+          const row=saved.rows[0];
+          const balance=await client.query('SELECT COALESCE(balance_iqd,0) AS balance_iqd FROM customer_balances WHERE market_id=$1 AND customer_id=$2',[user.market_id,row.id]);
+          const payload={customer:{...row,debt_limit_iqd:row.debt_limit_iqd===null?null:Number(row.debt_limit_iqd),version:Number(row.version),balance_iqd:Number(balance.rows[0]?.balance_iqd||0)}};
+          await client.query(`INSERT INTO idempotency_keys (market_id,scope,idempotency_key,request_hash,response_json,user_id) VALUES ($1,'customers.save',$2,$3,$4::jsonb,$5)`,[user.market_id,key,requestHash,JSON.stringify(payload),user.id]);
+          return {status:id?200:201,body:payload};
+        });
+        return json(res,result.status,result.body);
+      }
+
       if (req.method === 'GET' && url.pathname === '/api/v1/catalog/products') {
         const user = await authenticate(pool, req);
         if (!user) return json(res, 401, { error: 'AUTH_REQUIRED' });
@@ -464,7 +574,7 @@ export function createHandler(pool, configInput = {}) {
         const limit = safeLimit(url.searchParams.get('limit'));
         const afterId = String(url.searchParams.get('after_id') || '');
         const result = await pool.query(
-          `SELECT c.id,c.market_id,c.code,c.name,c.phone,c.address,c.notes,c.debt_limit_iqd,c.status,c.created_at,c.updated_at,
+          `SELECT c.id,c.market_id,c.code,c.name,c.phone,c.address,c.notes,c.debt_limit_iqd,c.status,c.version,c.created_at,c.updated_at,
                   COALESCE(cb.balance_iqd,0) AS balance_iqd
              FROM customers c
              LEFT JOIN customer_balances cb ON cb.market_id=c.market_id AND cb.customer_id=c.id
@@ -716,12 +826,25 @@ export function createHandler(pool, configInput = {}) {
           const response = {
             sale_id: saleId,
             receipt_number: receiptNumber,
+            payment_method: body.payment_method,
+            paid_method: paidIqd > 0 ? paidMethod : null,
+            customer_id: body.customer_id || null,
             subtotal_iqd: subtotal,
             discount_iqd: discountIqd,
             total_iqd: total,
             paid_iqd: paidIqd,
             debt_iqd: debt,
             customer_balance_iqd: customer ? balanceBefore + debt : null,
+            items: lines.map(line => ({
+              product_id: line.product.id,
+              product_name: line.product.name,
+              barcode: line.product.barcode,
+              quantity: line.quantity,
+              unit_price_iqd: Number(line.product.sale_price_iqd),
+              unit_cost_iqd: Number(line.product.cost_price_iqd),
+              line_total_iqd: line.lineTotal,
+              stock_after: line.stockAfter,
+            })),
           };
           await client.query(
             `INSERT INTO idempotency_keys (market_id, scope, idempotency_key, request_hash, response_json, user_id)

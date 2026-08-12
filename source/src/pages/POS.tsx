@@ -43,6 +43,7 @@ import { PriceCheckerModal } from '../components/features/PriceChecker';
 import { QuickCustomerAddModal } from '../components/features/QuickCustomerAdd';
 import { LastSaleReprintButton } from '../components/features/LastSalesWidget';
 import { ProductQuickView } from '../components/features/ProductQuickView';
+import { ApiError, serverApi } from '../services/serverApi';
 
 function formatCurrency(amount: number, currency: 'IQD' | 'USD' = 'IQD'): string {
   if (currency === 'USD') return `$${amount.toLocaleString()}`;
@@ -75,6 +76,8 @@ export function POSPage() {
   const [showPriceChecker, setShowPriceChecker] = useState(false);
   const [showQuickCustomer, setShowQuickCustomer] = useState(false);
   const [quickViewProduct, setQuickViewProduct] = useState<Product | null>(null);
+  const [isCompleting, setIsCompleting] = useState(false);
+  const pendingOperationRef = useRef<{key:string;operationId:string}|null>(null);
 
   const { user } = useAuthStore();
   const {
@@ -91,7 +94,7 @@ export function POSPage() {
     setCartPaymentType,
     setCartPaidAmount,
     setCartDiscount,
-    completeSale,
+    applyAuthoritativeSale,
     getCustomerBalance,
   } = useDataStore();
 
@@ -137,24 +140,22 @@ export function POSPage() {
     addToCart(product);
   };
 
-  const handleCompleteSale = () => {
-    if (!user) return;
-    const savedItems = [...cart.items];
-    const result = completeSale(user.id);
-    if (result.success && result.sale) {
-      setCompletedSale(result.sale);
-      setCompletedItems(savedItems);
-      setShowReceiptModal(true);
-      setShowMobileCart(false);
-      setDiscountValue(0);
-      playSaleSound();
-      toast.success(translations.pos.sale_completed);
-    } else {
-      const errorMessage = result.error
-        ? translations.errors[result.error as keyof typeof translations.errors]
-        : translations.errors.UNKNOWN_ERROR;
-      toast.error(errorMessage);
-    }
+  const handleCompleteSale = async () => {
+    if (!user || isCompleting || cart.items.length===0) return;
+    const savedItems=[...cart.items]; const cartSnapshot={...cart,items:[...cart.items]};
+    const pending=pendingOperationRef.current||{key:serverApi.createOperationId('sale-key'),operationId:serverApi.createOperationId('sale-op')};
+    pendingOperationRef.current=pending; setIsCompleting(true);
+    try {
+      const response=await serverApi.commitSale({client_operation_id:pending.operationId,customer_id:cart.customer_id,payment_method:cart.payment_type,paid_method:'cash',paid_iqd:cart.paid_amount,discount_iqd:cart.discount_amount,items:cart.items.map(item=>({product_id:item.product.id,quantity:item.quantity}))},pending.key);
+      const sale=applyAuthoritativeSale(response,user.id,cartSnapshot);
+      setCompletedSale(sale);
+      setCompletedItems(response.items.map(line=>{const original=savedItems.find(item=>item.product.id===line.product_id);return original?{...original,quantity:line.quantity,unit_price:line.unit_price_iqd,total_price:line.line_total_iqd}:{id:`receipt-${line.product_id}`,product_id:line.product_id,product:{id:line.product_id,name:line.product_name,barcode:line.barcode} as Product,quantity:line.quantity,unit_price:line.unit_price_iqd,discount_amount:0,total_price:line.line_total_iqd};}) as CartItem[]);
+      pendingOperationRef.current=null; setShowReceiptModal(true); setShowMobileCart(false); setDiscountValue(0); playSaleSound(); toast.success(translations.pos.sale_completed);
+    } catch(error) {
+      const code=error instanceof ApiError?error.code:'UNKNOWN_ERROR';
+      const messages:Record<string,string>={NETWORK_UNAVAILABLE:'پەیوەندی بە سێرڤەر نییە؛ مامەڵە تۆمار نەکرا',STOCK_INSUFFICIENT:'کۆگا بەس نییە',PRODUCT_UNAVAILABLE:'کالا لە سێرڤەر بەردەست نییە',CREDIT_LIMIT_EXCEEDED:'سنووری قەرزی کڕیار تێدەپەڕێت',CUSTOMER_REQUIRED_FOR_DEBT:'بۆ قەرز کڕیار دیاری بکە',DISCOUNT_REQUIRES_APPROVAL:'داشکاندن پێویستی بە پەسەندی بەڕێوەبەر هەیە',VERSION_CONFLICT:'داتا لە ئامێرێکی تر گۆڕاوە'};
+      toast.error(messages[code]||code);
+    } finally { setIsCompleting(false); }
   };
 
   const handleSelectCustomer = (customerId: string | undefined) => {
@@ -374,7 +375,7 @@ export function POSPage() {
 
         <div className="flex gap-2">
           <POSCalculatorButton totalDue={cart.total_amount} onConfirm={(amount) => setCartPaidAmount(amount)} />
-          <Button onClick={handleCompleteSale} disabled={cart.items.length === 0} className="flex-1 py-3.5 text-base" leftIcon={<CheckCircle className="w-5 h-5" />}>
+          <Button onClick={() => void handleCompleteSale()} disabled={cart.items.length === 0 || isCompleting} isLoading={isCompleting} className="flex-1 py-3.5 text-base" leftIcon={<CheckCircle className="w-5 h-5" />}>
             {translations.pos.complete_sale}
           </Button>
         </div>

@@ -23,6 +23,7 @@ import type {
   PaymentType,
   Currency,
 } from '../types';
+import type { ServerProduct, ServerCustomer, ServerSaleCommit } from '../services/serverApi';
 
 // ===== Production starts empty: no demo data =====
 
@@ -53,6 +54,10 @@ interface DataState {
   tenantContext: TenantContext | null;
   setTenantContext: (marketId: string, branchId: string) => void;
   clearTenantContext: () => void;
+  hydrateAuthoritativeCatalog: (products: ServerProduct[], customers: ServerCustomer[]) => void;
+  upsertAuthoritativeProduct: (product: ServerProduct) => void;
+  upsertAuthoritativeCustomer: (customer: ServerCustomer) => void;
+  applyAuthoritativeSale: (response: ServerSaleCommit, userId: string, cartSnapshot: Cart) => Sale;
 
   // Counters
   receiptCounter: number;
@@ -154,6 +159,27 @@ export const useDataStore = create<DataState>()(
         set({ tenantContext: { marketId, branchId } });
       },
       clearTenantContext: () => set({ tenantContext: null }),
+      hydrateAuthoritativeCatalog: (serverProducts, serverCustomers) => {
+        const tenant=requireTenantContext(get().tenantContext); const now=new Date().toISOString();
+        const products:Product[]=serverProducts.filter(p=>p.market_id===tenant.marketId).map(p=>({id:p.id,market_id:p.market_id,branch_id:p.branch_id,category_id:p.category_id||undefined,barcode:p.barcode,barcodes:p.barcodes||[],name:p.name,name_en:p.name_en||undefined,description:p.description||undefined,unit:p.unit,cost_price:p.cost_price_iqd,sale_price:p.sale_price_iqd,currency:p.currency,stock_quantity:p.stock_quantity,low_stock_limit:p.low_stock_limit,image_url:p.image_url||undefined,is_trackable:p.is_trackable,status:p.status,created_by:'server',created_at:p.created_at||now,updated_at:p.updated_at||now,version:p.version}));
+        const customers:Customer[]=serverCustomers.filter(c=>c.market_id===tenant.marketId).map(c=>({id:c.id,market_id:c.market_id,code:c.code,name:c.name,phone:c.phone||undefined,address:c.address||undefined,notes:c.notes||undefined,debt_limit:c.debt_limit_iqd??undefined,status:c.status,created_by:'server',created_at:c.created_at||now,updated_at:c.updated_at||now,version:c.version}));
+        const customerBalances:CustomerBalance[]=serverCustomers.filter(c=>c.market_id===tenant.marketId).map(c=>({id:`bal-${c.id}`,market_id:c.market_id,customer_id:c.id,balance_iqd:c.balance_iqd||0,balance_usd:0,updated_at:c.updated_at||now}));
+        set({products,customers,customerBalances});
+      },
+      upsertAuthoritativeProduct: (p) => { const now=new Date().toISOString(); const mapped:Product={id:p.id,market_id:p.market_id,branch_id:p.branch_id,category_id:p.category_id||undefined,barcode:p.barcode,barcodes:p.barcodes||[],name:p.name,name_en:p.name_en||undefined,description:p.description||undefined,unit:p.unit,cost_price:p.cost_price_iqd,sale_price:p.sale_price_iqd,currency:p.currency,stock_quantity:p.stock_quantity,low_stock_limit:p.low_stock_limit,image_url:p.image_url||undefined,is_trackable:p.is_trackable,status:p.status,created_by:'server',created_at:p.created_at||now,updated_at:p.updated_at||now,version:p.version}; set(state=>({products:[...state.products.filter(item=>item.id!==mapped.id),mapped]})); },
+      upsertAuthoritativeCustomer: (c) => { const now=new Date().toISOString(); const mapped:Customer={id:c.id,market_id:c.market_id,code:c.code,name:c.name,phone:c.phone||undefined,address:c.address||undefined,notes:c.notes||undefined,debt_limit:c.debt_limit_iqd??undefined,status:c.status,created_by:'server',created_at:c.created_at||now,updated_at:c.updated_at||now,version:c.version}; const balance:CustomerBalance={id:`bal-${c.id}`,market_id:c.market_id,customer_id:c.id,balance_iqd:c.balance_iqd||0,balance_usd:0,updated_at:c.updated_at||now}; set(state=>({customers:[...state.customers.filter(item=>item.id!==mapped.id),mapped],customerBalances:[...state.customerBalances.filter(item=>item.customer_id!==mapped.id),balance]})); },
+      applyAuthoritativeSale: (response,userId,cartSnapshot) => {
+        const tenant=requireTenantContext(get().tenantContext); const now=new Date().toISOString();
+        const customer=cartSnapshot.customer_id?get().getCustomerById(cartSnapshot.customer_id):undefined;
+        const paymentType = (['cash','debt','mixed'].includes(response.payment_method)?response.payment_method:(response.debt_iqd>0?'mixed':'cash')) as PaymentType;
+        const sale:Sale={id:response.sale_id,market_id:tenant.marketId,branch_id:tenant.branchId,receipt_number:response.receipt_number,customer_id:response.customer_id||undefined,customer,cashier_id:userId,subtotal:response.subtotal_iqd,discount_amount:response.discount_iqd,total_amount:response.total_iqd,paid_amount:response.paid_iqd,debt_amount:response.debt_iqd,payment_type:paymentType,currency:'IQD',status:'completed',created_at:now,updated_at:now};
+        const saleItems:SaleItem[]=response.items.map(line=>{const product=get().getProductById(line.product_id);return{id:`si-${response.sale_id}-${line.product_id}`,sale_id:response.sale_id,product_id:line.product_id,product,quantity:line.quantity,unit_price:line.unit_price_iqd,discount_amount:0,total_price:line.line_total_iqd,cost_price:line.unit_cost_iqd,created_at:now};});
+        const payments:Payment[]=response.paid_iqd>0?[{id:`pay-${response.sale_id}`,market_id:tenant.marketId,branch_id:tenant.branchId,payment_for:'sale',reference_id:response.sale_id,customer_id:response.customer_id||undefined,amount:response.paid_iqd,currency:'IQD',payment_method:response.paid_method==='bank'?'transfer':response.paid_method==='card'?'card':'cash',received_by:userId,created_at:now}]:[];
+        const debtTransactions:DebtTransaction[]=response.debt_iqd>0&&response.customer_id?[{id:`dt-${response.sale_id}`,market_id:tenant.marketId,branch_id:tenant.branchId,customer_id:response.customer_id,type:'debt_added',amount:response.debt_iqd,currency:'IQD',balance_before:Math.max(0,(response.customer_balance_iqd||0)-response.debt_iqd),balance_after:response.customer_balance_iqd||response.debt_iqd,reference_type:'sale',reference_id:response.sale_id,created_by:userId,created_at:now}]:[];
+        const stockMovements:StockMovement[]=response.items.map(line=>{const current=get().getProductById(line.product_id);return{id:`sm-${response.sale_id}-${line.product_id}`,market_id:tenant.marketId,branch_id:tenant.branchId,product_id:line.product_id,product:current,type:'sale',quantity:-line.quantity,stock_before:line.stock_after+line.quantity,stock_after:line.stock_after,reference_type:'sale',reference_id:response.sale_id,created_by:userId,created_at:now};});
+        set(state=>({sales:[...state.sales.filter(s=>s.id!==sale.id),sale],saleItems:[...state.saleItems.filter(i=>i.sale_id!==sale.id),...saleItems],payments:[...state.payments.filter(p=>p.reference_id!==sale.id),...payments],debtTransactions:[...state.debtTransactions.filter(d=>d.reference_id!==sale.id),...debtTransactions],stockMovements:[...state.stockMovements.filter(m=>m.reference_id!==sale.id),...stockMovements],products:state.products.map(p=>{const line=response.items.find(i=>i.product_id===p.id);return line?{...p,stock_quantity:line.stock_after,updated_at:now}:p;}),customerBalances:state.customerBalances.map(b=>response.customer_id&&b.customer_id===response.customer_id&&response.customer_balance_iqd!==null?{...b,balance_iqd:response.customer_balance_iqd,updated_at:now}:b),cart:emptyCart}));
+        return sale;
+      },
       receiptCounter: 1000,
 
       // Category Actions

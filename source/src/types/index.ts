@@ -124,6 +124,7 @@ export interface Product {
   created_by: ID;
   created_at: string;
   updated_at: string;
+  version?: number;
 }
 
 // ===== Customers =====
@@ -140,6 +141,7 @@ export interface Customer {
   created_by: ID;
   created_at: string;
   updated_at: string;
+  version?: number;
 }
 
 export interface CustomerBalance {

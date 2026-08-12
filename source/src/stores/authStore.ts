@@ -95,11 +95,14 @@ const toLocalContext = (context: ServerContext) => {
 
 async function bindTenant(context: ReturnType<typeof toLocalContext> | null) {
   const { useDataStore } = await import('./dataStore');
-  if (!context?.branch) {
-    useDataStore.getState().clearTenantContext();
-    return;
-  }
+  if (!context?.branch) { useDataStore.getState().clearTenantContext(); return; }
   useDataStore.getState().setTenantContext(context.market.id, context.branch.id);
+  try {
+    const [products,customers]=await Promise.all([serverApi.loadProducts(),serverApi.loadCustomers()]);
+    useDataStore.getState().hydrateAuthoritativeCatalog(products,customers);
+  } catch (error) {
+    console.warn('Authoritative catalog hydration failed; keeping last local cache', error);
+  }
 }
 
 export const useAuthStore = create<AuthState>((set, get) => ({
