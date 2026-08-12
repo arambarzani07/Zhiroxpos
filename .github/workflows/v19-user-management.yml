@@ -1,0 +1,81 @@
+name: V19 Authoritative User Management
+
+on:
+  push:
+    branches:
+      - v19-production-readiness
+    paths:
+      - 'tools/v19_add_user_management.py'
+      - '.github/workflows/v19-user-management.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  user-management:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: zhirox
+          POSTGRES_PASSWORD: zhirox_test_password
+          POSTGRES_DB: zhirox_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zhirox -d zhirox_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://zhirox:zhirox_test_password@127.0.0.1:5432/zhirox_test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v19-production-readiness
+      - name: Generate authoritative user management
+        run: python3 tools/v19_add_user_management.py
+      - name: Syntax-check server
+        working-directory: source/server
+        run: node --check src/app.mjs
+      - name: Install and audit server
+        working-directory: source/server
+        run: |
+          npm ci
+          npm audit --omit=dev --audit-level=high
+      - name: Run PostgreSQL auth, user, session, offline and financial tests
+        working-directory: source/server
+        run: npm test
+      - name: Install frontend
+        working-directory: source
+        run: npm ci
+      - name: Production user authority gate
+        working-directory: source
+        run: |
+          npm run check:production
+          if grep -R -n -E "localStorage.*(user|password)|passwordHash|passwordSalt|defaultUsers|MOCK_USERS" src/pages src/stores src/components/features/ServerUserManager.tsx --include='*.ts' --include='*.tsx'; then
+            echo 'Browser-local user/password authority is forbidden.'
+            exit 1
+          fi
+          if ! grep -q "serverApi.saveUser" src/components/features/ServerUserManager.tsx; then
+            echo 'Settings user management is not wired to the server.'
+            exit 1
+          fi
+      - name: TypeScript and production build
+        working-directory: source
+        run: |
+          npx tsc --noEmit
+          npm run build
+      - name: Commit verified user-management authority
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add source/src source/server
+          if git diff --cached --quiet; then
+            echo 'User management already committed.'
+            exit 0
+          fi
+          git commit -m 'Add server-authoritative user management for v19'
+          git push origin HEAD:v19-production-readiness
