@@ -26,6 +26,13 @@ import type {
 
 // ===== Production starts empty: no demo data =====
 
+type TenantContext = { marketId: string; branchId: string };
+
+const requireTenantContext = (context: TenantContext | null): TenantContext => {
+  if (!context?.marketId || !context?.branchId) throw new Error('TENANT_CONTEXT_REQUIRED');
+  return context;
+};
+
 interface DataState {
   // Data
   categories: Category[];
@@ -41,6 +48,11 @@ interface DataState {
 
   // Cart
   cart: Cart;
+
+  // Tenant authority (set only after authenticated session)
+  tenantContext: TenantContext | null;
+  setTenantContext: (marketId: string, branchId: string) => void;
+  clearTenantContext: () => void;
 
   // Counters
   receiptCounter: number;
@@ -136,6 +148,12 @@ export const useDataStore = create<DataState>()(
       stockMovements: [],
       auditLogs: [],
       cart: emptyCart,
+      tenantContext: null,
+      setTenantContext: (marketId, branchId) => {
+        if (!marketId || !branchId) throw new Error('TENANT_CONTEXT_REQUIRED');
+        set({ tenantContext: { marketId, branchId } });
+      },
+      clearTenantContext: () => set({ tenantContext: null }),
       receiptCounter: 1000,
 
       // Category Actions
@@ -144,8 +162,10 @@ export const useDataStore = create<DataState>()(
       getCategoryById: (id: string) => get().categories.find(c => c.id === id),
       
       addCategory: (category) => {
+        const tenant = requireTenantContext(get().tenantContext);
         const newCategory: Category = {
           ...category,
+          market_id: tenant.marketId,
           id: `cat-${uuidv4()}`,
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
@@ -172,8 +192,11 @@ export const useDataStore = create<DataState>()(
       getLowStockProducts: () => get().products.filter(p => p.stock_quantity <= p.low_stock_limit && p.status === 'active'),
       
       addProduct: (product) => {
+        const tenant = requireTenantContext(get().tenantContext);
         const newProduct: Product = {
           ...product,
+          market_id: tenant.marketId,
+          branch_id: tenant.branchId,
           id: `prod-${uuidv4()}`,
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
@@ -216,10 +239,12 @@ export const useDataStore = create<DataState>()(
       },
       
       addCustomer: (customer) => {
+        const tenant = requireTenantContext(get().tenantContext);
         const customers = get().customers;
         const newCode = `C${String(customers.length + 1).padStart(3, '0')}`;
         const newCustomer: Customer = {
           ...customer,
+          market_id: tenant.marketId,
           id: `cust-${uuidv4()}`,
           code: newCode,
           created_at: new Date().toISOString(),
@@ -229,7 +254,7 @@ export const useDataStore = create<DataState>()(
         // Create initial balance
         const newBalance: CustomerBalance = {
           id: `bal-${uuidv4()}`,
-          market_id: customer.market_id,
+          market_id: tenant.marketId,
           customer_id: newCustomer.id,
           balance_iqd: 0,
           balance_usd: 0,
@@ -434,6 +459,7 @@ export const useDataStore = create<DataState>()(
       },
 
       completeSale: (userId) => {
+        const tenant = requireTenantContext(get().tenantContext);
         const { cart, generateReceiptNumber, updateProductStock, updateCustomerBalance, addAuditLog } = get();
 
         // Validations
@@ -478,8 +504,8 @@ export const useDataStore = create<DataState>()(
         // Create sale
         const sale: Sale = {
           id: saleId,
-          market_id: 'market-1',
-          branch_id: 'branch-1',
+          market_id: tenant.marketId,
+          branch_id: tenant.branchId,
           receipt_number: receiptNumber,
           customer_id: cart.customer_id,
           customer: cart.customer,
@@ -515,8 +541,8 @@ export const useDataStore = create<DataState>()(
         if (cart.paid_amount > 0) {
           payments.push({
             id: `pay-${uuidv4()}`,
-            market_id: 'market-1',
-            branch_id: 'branch-1',
+            market_id: tenant.marketId,
+            branch_id: tenant.branchId,
             payment_for: 'sale',
             reference_id: saleId,
             customer_id: cart.customer_id,
@@ -536,8 +562,8 @@ export const useDataStore = create<DataState>()(
           
           debtTransactions.push({
             id: `dt-${uuidv4()}`,
-            market_id: 'market-1',
-            branch_id: 'branch-1',
+            market_id: tenant.marketId,
+            branch_id: tenant.branchId,
             customer_id: cart.customer_id,
             type: 'debt_added',
             amount: cart.debt_amount,
@@ -563,8 +589,8 @@ export const useDataStore = create<DataState>()(
 
             stockMovements.push({
               id: `sm-${uuidv4()}`,
-              market_id: 'market-1',
-              branch_id: 'branch-1',
+              market_id: tenant.marketId,
+              branch_id: tenant.branchId,
               product_id: item.product.id,
               type: 'sale',
               quantity: -item.quantity,
@@ -592,8 +618,8 @@ export const useDataStore = create<DataState>()(
 
         // Add audit log
         addAuditLog({
-          market_id: 'market-1',
-          branch_id: 'branch-1',
+          market_id: tenant.marketId,
+          branch_id: tenant.branchId,
           user_id: userId,
           action: 'sales.completed',
           module: 'sales',
@@ -609,6 +635,7 @@ export const useDataStore = create<DataState>()(
       getPayments: () => get().payments,
 
       addDebtPayment: (customerId, amount, currency, userId, notes) => {
+        const tenant = requireTenantContext(get().tenantContext);
         const now = new Date().toISOString();
         const currentBalance = get().getCustomerBalance(customerId);
         const balanceBefore = currency === 'IQD' ? (currentBalance?.balance_iqd || 0) : (currentBalance?.balance_usd || 0);
@@ -616,8 +643,8 @@ export const useDataStore = create<DataState>()(
         // Create payment
         const payment: Payment = {
           id: `pay-${uuidv4()}`,
-          market_id: 'market-1',
-          branch_id: 'branch-1',
+          market_id: tenant.marketId,
+          branch_id: tenant.branchId,
           payment_for: 'debt_payment',
           customer_id: customerId,
           amount,
@@ -631,8 +658,8 @@ export const useDataStore = create<DataState>()(
         // Create debt transaction
         const debtTransaction: DebtTransaction = {
           id: `dt-${uuidv4()}`,
-          market_id: 'market-1',
-          branch_id: 'branch-1',
+          market_id: tenant.marketId,
+          branch_id: tenant.branchId,
           customer_id: customerId,
           type: 'debt_payment',
           amount: -amount,
@@ -657,8 +684,8 @@ export const useDataStore = create<DataState>()(
 
         // Add audit log
         get().addAuditLog({
-          market_id: 'market-1',
-          branch_id: 'branch-1',
+          market_id: tenant.marketId,
+          branch_id: tenant.branchId,
           user_id: userId,
           action: 'debt.payment',
           module: 'debt',
@@ -693,6 +720,7 @@ export const useDataStore = create<DataState>()(
       },
 
       adjustStock: (productId, quantity, type, userId, notes) => {
+        const tenant = requireTenantContext(get().tenantContext);
         const product = get().getProductById(productId);
         if (!product) throw new Error('Product not found');
 
@@ -700,8 +728,8 @@ export const useDataStore = create<DataState>()(
         const stockAfter = stockBefore + quantity;
 
         const movement = get().addStockMovement({
-          market_id: 'market-1',
-          branch_id: 'branch-1',
+          market_id: tenant.marketId,
+          branch_id: tenant.branchId,
           product_id: productId,
           type,
           quantity,
@@ -714,8 +742,8 @@ export const useDataStore = create<DataState>()(
         get().updateProductStock(productId, stockAfter);
 
         get().addAuditLog({
-          market_id: 'market-1',
-          branch_id: 'branch-1',
+          market_id: tenant.marketId,
+          branch_id: tenant.branchId,
           user_id: userId,
           action: 'stock.adjusted',
           module: 'inventory',

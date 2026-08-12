@@ -63,13 +63,17 @@ export function CustomersPage() {
   });
 
   const handleSaveCustomer = (customerData: Partial<Customer>) => {
+    if (!user?.market_id || !user.branch_id) {
+      toast.error('هەژماری فرۆشگا/لق دیاری نەکراوە');
+      return;
+    }
     if (editingCustomer) {
       updateCustomer(editingCustomer.id, customerData);
       
       if (user) {
         addAuditLog({
-          market_id: 'market-1',
-          branch_id: 'branch-1',
+          market_id: user.market_id,
+          branch_id: user.branch_id,
           user_id: user.id,
           action: 'customers.update',
           module: 'customers',
@@ -84,20 +88,20 @@ export function CustomersPage() {
       setEditingCustomer(null);
     } else {
       const newCustomer = addCustomer({
-        market_id: 'market-1',
+        market_id: user.market_id,
         name: customerData.name || '',
         phone: customerData.phone,
         address: customerData.address,
         notes: customerData.notes,
         debt_limit: customerData.debt_limit,
         status: 'active',
-        created_by: user?.id || '',
+        created_by: user.id,
       });
 
       if (user) {
         addAuditLog({
-          market_id: 'market-1',
-          branch_id: 'branch-1',
+          market_id: user.market_id,
+          branch_id: user.branch_id,
           user_id: user.id,
           action: 'customers.create',
           module: 'customers',

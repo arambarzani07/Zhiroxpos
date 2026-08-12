@@ -65,16 +65,19 @@ function OpenSessionModal({ isOpen, onClose }: { isOpen: boolean; onClose: () =>
   const [amount, setAmount] = useState(0);
 
   const handleOpen = () => {
-    if (!user) return;
+    if (!user?.market_id || !user.branch_id) {
+      toast.error('هەژماری فرۆشگا/لق دیاری نەکراوە');
+      return;
+    }
     const session: CashSession = {
-      id: `cs-${Date.now()}`, market_id: 'market-1', branch_id: 'branch-1',
+      id: `cs-${Date.now()}`, market_id: user.market_id, branch_id: user.branch_id,
       cashier_id: user.id, opening_amount: amount, currency: 'IQD',
       status: 'open', opened_at: new Date().toISOString(),
     };
     const sessions = getSessions();
     sessions.push(session);
     saveSessions(sessions);
-    addAuditLog({ market_id: 'market-1', branch_id: 'branch-1', user_id: user.id, action: 'settings.changed', module: 'cash_session', table_name: 'cash_sessions', record_id: session.id, new_value: { opening_amount: amount } as any });
+    addAuditLog({ market_id: user.market_id, branch_id: user.branch_id, user_id: user.id, action: 'settings.changed', module: 'cash_session', table_name: 'cash_sessions', record_id: session.id, new_value: { opening_amount: amount } as any });
     toast.success('صندوق کرایەوە');
     setAmount(0);
     onClose();
@@ -114,14 +117,17 @@ function CloseSessionModal({ isOpen, onClose, session }: { isOpen: boolean; onCl
   }, [session, getSales]);
 
   const handleClose = () => {
-    if (!session || !user || !stats) return;
+    if (!session || !user?.market_id || !user.branch_id || !stats) {
+      toast.error('هەژماری فرۆشگا/لق دیاری نەکراوە');
+      return;
+    }
     const sessions = getSessions().map(s => s.id === session.id ? {
       ...s, status: 'closed' as const, closing_amount: closingAmount,
       expected_amount: stats.expected, difference: closingAmount - stats.expected,
       closed_at: new Date().toISOString(),
     } : s);
     saveSessions(sessions);
-    addAuditLog({ market_id: 'market-1', branch_id: 'branch-1', user_id: user.id, action: 'settings.changed', module: 'cash_session', table_name: 'cash_sessions', record_id: session.id, new_value: { closing_amount: closingAmount, expected: stats.expected, difference: closingAmount - stats.expected } as any });
+    addAuditLog({ market_id: user.market_id, branch_id: user.branch_id, user_id: user.id, action: 'settings.changed', module: 'cash_session', table_name: 'cash_sessions', record_id: session.id, new_value: { closing_amount: closingAmount, expected: stats.expected, difference: closingAmount - stats.expected } as any });
     toast.success('صندوق داخرا');
     onClose();
   };

@@ -24,16 +24,20 @@ export function CategoryManager() {
   const activeCategories = getCategories();
 
   const handleAdd = () => {
+    if (!user?.market_id || !user.branch_id) {
+      toast.error('هەژماری فرۆشگا/لق دیاری نەکراوە');
+      return;
+    }
     if (!newName.trim()) return;
     const cat = addCategory({
-      market_id: 'market-1',
+      market_id: user.market_id,
       name: newName.trim(),
       name_en: newNameEn.trim() || undefined,
       sort_order: categories.length + 1,
       status: 'active',
     });
     if (user) {
-      addAuditLog({ market_id: 'market-1', user_id: user.id, action: 'products.create', module: 'categories', table_name: 'categories', record_id: cat.id, new_value: { name: cat.name } });
+      addAuditLog({ market_id: user.market_id, user_id: user.id, action: 'products.create', module: 'categories', table_name: 'categories', record_id: cat.id, new_value: { name: cat.name } });
     }
     setNewName('');
     setNewNameEn('');
@@ -42,10 +46,14 @@ export function CategoryManager() {
   };
 
   const handleEdit = (id: string) => {
+    if (!user?.market_id || !user.branch_id) {
+      toast.error('هەژماری فرۆشگا/لق دیاری نەکراوە');
+      return;
+    }
     if (!editName.trim()) return;
     updateCategory(id, { name: editName.trim() });
     if (user) {
-      addAuditLog({ market_id: 'market-1', user_id: user.id, action: 'products.update', module: 'categories', table_name: 'categories', record_id: id, new_value: { name: editName } });
+      addAuditLog({ market_id: user.market_id, user_id: user.id, action: 'products.update', module: 'categories', table_name: 'categories', record_id: id, new_value: { name: editName } });
     }
     setEditId(null);
     setEditName('');

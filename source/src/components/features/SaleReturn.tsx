@@ -33,7 +33,10 @@ export function SaleReturnModal({ isOpen, onClose }: { isOpen: boolean; onClose:
   };
 
   const handleReturn = () => {
-    if (!user || !foundSale) return;
+    if (!user?.market_id || !user.branch_id || !foundSale) {
+      toast.error('هەژماری فرۆشگا/لق دیاری نەکراوە');
+      return;
+    }
     const itemsToReturn = Object.entries(returnItems).filter(([, qty]) => qty > 0);
     if (itemsToReturn.length === 0) { toast.error('هیچ کاڵایەک هەڵنەبژێردراوە'); return; }
     if (!reason.trim()) { toast.error('هۆکاری گەڕانەوە بنووسە'); return; }
@@ -57,7 +60,7 @@ export function SaleReturnModal({ isOpen, onClose }: { isOpen: boolean; onClose:
         const { stockMovements } = useDataStore.getState();
         useDataStore.setState({
           stockMovements: [...stockMovements, {
-            id: `sm-${uuidv4()}`, market_id: 'market-1', branch_id: 'branch-1',
+            id: `sm-${uuidv4()}`, market_id: user.market_id, branch_id: user.branch_id,
             product_id: product.id, type: 'return' as const, quantity: qty,
             stock_before: product.stock_quantity, stock_after: newStock,
             reference_type: 'sale', reference_id: foundSale.id,
@@ -76,7 +79,7 @@ export function SaleReturnModal({ isOpen, onClose }: { isOpen: boolean; onClose:
         const { debtTransactions } = useDataStore.getState();
         useDataStore.setState({
           debtTransactions: [...debtTransactions, {
-            id: `dt-${uuidv4()}`, market_id: 'market-1', branch_id: 'branch-1',
+            id: `dt-${uuidv4()}`, market_id: user.market_id, branch_id: user.branch_id,
             customer_id: foundSale.customer_id, type: 'debt_adjustment' as const,
             amount: -refundDebt, currency: foundSale.currency,
             balance_before: (bal?.balance_iqd || 0) + refundDebt, balance_after: bal?.balance_iqd || 0,
@@ -88,7 +91,7 @@ export function SaleReturnModal({ isOpen, onClose }: { isOpen: boolean; onClose:
     }
 
     addAuditLog({
-      market_id: 'market-1', branch_id: 'branch-1', user_id: user.id,
+      market_id: user.market_id, branch_id: user.branch_id, user_id: user.id,
       action: 'sales.cancelled', module: 'sales', table_name: 'sales',
       record_id: foundSale.id,
       new_value: { type: 'return', items: itemsToReturn, total_refund: totalRefund, reason } as any,

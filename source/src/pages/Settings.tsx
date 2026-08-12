@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Store, Users, Shield, Receipt, DollarSign, Zap, Save, ChevronLeft, Plus, Edit, Lock, Check } from 'lucide-react';
+import { Store, Users, Shield, Receipt, DollarSign, Zap, Save, ChevronLeft } from 'lucide-react';
 import { useAuthStore } from '../stores/authStore';
 import { useDataStore } from '../stores/dataStore';
 import { translations } from '../constants/translations';
@@ -10,7 +10,6 @@ import { Card, CardHeader } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
 import { Select } from '../components/ui/Select';
-import { Modal } from '../components/ui/Modal';
 import { Badge } from '../components/ui/Badge';
 import { toast } from '../components/ui/Toast';
 import { cn } from '../utils/cn';
@@ -23,19 +22,7 @@ import { Database } from 'lucide-react';
 
 type SettingsTab = 'general' | 'categories' | 'users' | 'roles' | 'receipt' | 'currency' | 'cashsession' | 'features' | 'backup';
 
-// User management store (local)
-interface LocalUser { id: string; name: string; username: string; phone: string; role: string; status: 'active' | 'blocked'; password: string; }
-
-function getUsers(): LocalUser[] {
-  try { return JSON.parse(localStorage.getItem('zhirox-users') || '[]'); } catch { return []; }
-}
-function saveUsers(u: LocalUser[]) { localStorage.setItem('zhirox-users', JSON.stringify(u)); }
-
-const defaultUsers: LocalUser[] = [
-  { id: 'u1', name: 'خاوەنی مارکێت', username: 'owner', phone: '07501234567', role: 'owner', status: 'active', password: '123456' },
-  { id: 'u2', name: 'بەڕێوەبەر', username: 'admin', phone: '07502345678', role: 'admin', status: 'active', password: '123456' },
-  { id: 'u3', name: 'کاشێر ١', username: 'cashier', phone: '07503456789', role: 'cashier', status: 'active', password: '123456' },
-];
+// User management is server-authoritative in v19; no local password/user database.
 
 // Receipt settings store
 function getReceiptSettings() {
@@ -55,29 +42,20 @@ export function SettingsPage() {
   const { addAuditLog } = useDataStore();
 
   const [marketSettings, setMarketSettings] = useState({
-    name: market?.name || 'سوپەرمارکێتی ژیرۆکس',
-    phone: market?.phone || '07501234567',
-    address: market?.address || 'سلێمانی، شەقامی سالم',
+    name: market?.name || '',
+    phone: market?.phone || '',
+    address: market?.address || '',
     currency: market?.currency || 'IQD',
   });
 
   const [featureFlags, setFeatureFlags] = useState(DEFAULT_FEATURE_FLAGS);
 
-  // User management
-  const [users, setUsers] = useState<LocalUser[]>(() => {
-    const saved = getUsers();
-    return saved.length > 0 ? saved : defaultUsers;
-  });
-  const [showUserModal, setShowUserModal] = useState(false);
-  const [editingUser, setEditingUser] = useState<LocalUser | null>(null);
-  const [userForm, setUserForm] = useState({ name: '', username: '', phone: '', role: 'cashier', password: '123456' });
-
   // Receipt settings
   const [receiptSettings, setReceiptSettings] = useState(() => ({
-    shopName: 'ZHIROX',
-    shopSubtitle: 'سوپەرمارکێت',
-    shopAddress: 'سلێمانی، شەقامی سالم',
-    shopPhone: '07501234567',
+    shopName: market?.name || 'ZHIROX',
+    shopSubtitle: '',
+    shopAddress: market?.address || '',
+    shopPhone: market?.phone || '',
     footerText: 'سوپاس بۆ کڕینت!',
     showLogo: true,
     showQR: true,
@@ -91,26 +69,9 @@ export function SettingsPage() {
   const [editingRole, setEditingRole] = useState<string | null>(null);
 
   const handleSaveSettings = () => {
-    if (currentUser) addAuditLog({ market_id: 'market-1', user_id: currentUser.id, action: 'settings.changed', module: 'settings', table_name: 'settings', new_value: marketSettings as any });
+    if (!currentUser?.market_id || !currentUser.branch_id) { toast.error('هەژماری فرۆشگا/لق دیاری نەکراوە'); return; }
+    addAuditLog({ market_id: currentUser.market_id, branch_id: currentUser.branch_id, user_id: currentUser.id, action: 'settings.changed', module: 'settings', table_name: 'settings', new_value: marketSettings as any });
     toast.success(translations.settings.settings_saved);
-  };
-
-  const handleSaveUser = () => {
-    const updated = editingUser
-      ? users.map(u => u.id === editingUser.id ? { ...editingUser, ...userForm, status: editingUser.status } as LocalUser : u)
-      : [...users, { id: `u${Date.now()}`, ...userForm, status: 'active' as const }];
-    setUsers(updated);
-    saveUsers(updated);
-    setShowUserModal(false);
-    setEditingUser(null);
-    setUserForm({ name: '', username: '', phone: '', role: 'cashier', password: '123456' });
-    toast.success(editingUser ? 'بەکارهێنەر نوێکرایەوە' : 'بەکارهێنەر زیادکرا');
-  };
-
-  const handleToggleUserStatus = (userId: string) => {
-    const updated = users.map(u => u.id === userId ? { ...u, status: u.status === 'active' ? 'blocked' as const : 'active' as const } : u);
-    setUsers(updated);
-    saveUsers(updated);
   };
 
   const handleSaveReceiptSettings = () => {
@@ -135,13 +96,7 @@ export function SettingsPage() {
     { id: 'backup', label: 'باکئەپ و داتا', icon: Database },
   ];
 
-  const roleOptions = [
-    { value: 'owner', label: 'خاوەن' }, { value: 'admin', label: 'بەڕێوەبەر' },
-    { value: 'cashier', label: 'کاشێر' }, { value: 'stock_staff', label: 'بەرپرسی کۆگا' },
-    { value: 'accountant', label: 'ژمێریار' },
-  ];
 
-  const roleColors: Record<string, string> = { owner: 'indigo', admin: 'emerald', cashier: 'amber', stock_staff: 'blue', accountant: 'purple' };
   const roleLabels: Record<string, string> = { owner: 'خاوەن', admin: 'بەڕێوەبەر', cashier: 'کاشێر', stock_staff: 'بەرپرسی کۆگا', accountant: 'ژمێریار' };
 
   const showMobileMenu = activeTab === null;
@@ -170,55 +125,17 @@ export function SettingsPage() {
       case 'users':
         return (
           <Card>
-            <CardHeader title={translations.settings.users} subtitle={`${users.length} بەکارهێنەر`} icon={<Users className="w-5 h-5" />}
-              action={hasPermission(PERMISSIONS.USERS_CREATE) && <Button size="sm" onClick={() => { setEditingUser(null); setUserForm({ name: '', username: '', phone: '', role: 'cashier', password: '123456' }); setShowUserModal(true); }} leftIcon={<Plus className="w-4 h-4" />}>زیادکردن</Button>}
-            />
-            <div className="space-y-2">
-              {users.map(u => (
-                <div key={u.id} className={cn("flex items-center justify-between p-3 rounded-xl border", u.status === 'blocked' ? 'bg-red-50 border-red-200 opacity-70' : 'bg-slate-50 border-slate-200')}>
-                  <div className="flex items-center gap-3">
-                    <div className={cn("w-10 h-10 rounded-xl flex items-center justify-center text-white font-bold", `bg-${roleColors[u.role] || 'slate'}-500`)} style={{ backgroundColor: u.role === 'owner' ? '#6366f1' : u.role === 'admin' ? '#10b981' : u.role === 'cashier' ? '#f59e0b' : u.role === 'stock_staff' ? '#3b82f6' : '#a855f7' }}>
-                      {u.name.charAt(0)}
-                    </div>
-                    <div>
-                      <p className="font-medium text-sm text-slate-900">{u.name}</p>
-                      <div className="flex items-center gap-2">
-                        <p className="text-xs text-slate-500">{u.username}</p>
-                        <Badge variant={u.status === 'active' ? 'success' : 'danger'} size="sm">{u.status === 'active' ? 'چالاک' : 'بلۆک'}</Badge>
-                      </div>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <Badge size="sm">{roleLabels[u.role] || u.role}</Badge>
-                    {hasPermission(PERMISSIONS.USERS_EDIT) && (
-                      <>
-                        <Button variant="ghost" size="sm" onClick={() => { setEditingUser(u); setUserForm({ name: u.name, username: u.username, phone: u.phone, role: u.role, password: '' }); setShowUserModal(true); }}><Edit className="w-4 h-4" /></Button>
-                        <Button variant="ghost" size="sm" onClick={() => handleToggleUserStatus(u.id)} className={u.status === 'active' ? 'text-red-500' : 'text-emerald-500'}>
-                          {u.status === 'active' ? <Lock className="w-4 h-4" /> : <Check className="w-4 h-4" />}
-                        </Button>
-                      </>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-
-            {/* User Form Modal */}
-            <Modal isOpen={showUserModal} onClose={() => setShowUserModal(false)} title={editingUser ? 'دەستکاریکردنی بەکارهێنەر' : 'زیادکردنی بەکارهێنەر'} size="md">
-              <div className="space-y-4">
-                <Input label="ناوی تەواو" value={userForm.name} onChange={e => setUserForm({ ...userForm, name: e.target.value })} required />
-                <div className="grid grid-cols-2 gap-4">
-                  <Input label="ناوی بەکارهێنەر" value={userForm.username} onChange={e => setUserForm({ ...userForm, username: e.target.value })} required disabled={!!editingUser} />
-                  <Input label="ژمارەی مۆبایل" value={userForm.phone} onChange={e => setUserForm({ ...userForm, phone: e.target.value })} />
-                </div>
-                <Select label="ڕۆڵ" value={userForm.role} onChange={e => setUserForm({ ...userForm, role: e.target.value })} options={roleOptions} />
-                <Input label="وشەی نهێنی" type="password" value={userForm.password} onChange={e => setUserForm({ ...userForm, password: e.target.value })} placeholder={editingUser ? 'بەتاڵ = نەگۆڕدراو' : '123456'} />
-                <div className="flex flex-col-reverse sm:flex-row justify-end gap-2 pt-4 border-t">
-                  <Button variant="secondary" onClick={() => setShowUserModal(false)} className="w-full sm:w-auto">هەڵوەشاندنەوە</Button>
-                  <Button onClick={handleSaveUser} disabled={!userForm.name || !userForm.username} className="w-full sm:w-auto">پاشەکەوتکردن</Button>
-                </div>
+            <CardHeader title={translations.settings.users} subtitle="بەڕێوەبردنی بەکارهێنەر لە سێرڤەری Production" icon={<Users className="w-5 h-5" />} />
+            <div className="space-y-4">
+              <div className="p-4 rounded-xl border border-indigo-200 bg-indigo-50">
+                <p className="font-medium text-indigo-900">هەژماری چالاک</p>
+                <p className="text-sm text-indigo-700 mt-1">{currentUser?.full_name || '-'} • {currentUser?.username || '-'}</p>
               </div>
-            </Modal>
+              <p className="text-sm text-slate-600 leading-7">
+                لە وەشانی Production هیچ وشەی نهێنی یان لیستی بەکارهێنەر لە localStorage ناپارێزرێت. زیادکردن، گۆڕینی ڕۆڵ و بلۆککردنی بەکارهێنەر تەنها لە API ـی پارێزراوی سێرڤەر جێبەجێ دەکرێت.
+              </p>
+              <Badge variant="warning">Server-authoritative only</Badge>
+            </div>
           </Card>
         );
 

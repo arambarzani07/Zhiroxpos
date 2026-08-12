@@ -57,13 +57,17 @@ export function ProductsPage() {
   });
 
   const handleSaveProduct = (productData: Partial<Product>) => {
+    if (!user?.market_id || !user.branch_id) {
+      toast.error('هەژماری فرۆشگا/لق دیاری نەکراوە');
+      return;
+    }
     if (editingProduct) {
       updateProduct(editingProduct.id, productData);
       
       if (user) {
         addAuditLog({
-          market_id: 'market-1',
-          branch_id: 'branch-1',
+          market_id: user.market_id,
+          branch_id: user.branch_id,
           user_id: user.id,
           action: 'products.update',
           module: 'products',
@@ -91,8 +95,8 @@ export function ProductsPage() {
         ? productData.barcodes : [primaryBarcode].filter(Boolean);
 
       const newProduct = addProduct({
-        market_id: 'market-1',
-        branch_id: 'branch-1',
+        market_id: user.market_id,
+        branch_id: user.branch_id,
         category_id: productData.category_id,
         barcode: primaryBarcode,
         barcodes: allBarcodes,
@@ -107,13 +111,13 @@ export function ProductsPage() {
         low_stock_limit: productData.low_stock_limit || 10,
         is_trackable: true,
         status: 'active',
-        created_by: user?.id || '',
+        created_by: user.id,
       });
 
       if (user) {
         addAuditLog({
-          market_id: 'market-1',
-          branch_id: 'branch-1',
+          market_id: user.market_id,
+          branch_id: user.branch_id,
           user_id: user.id,
           action: 'products.create',
           module: 'products',

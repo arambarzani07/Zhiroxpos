@@ -38,15 +38,18 @@ export function SaleHistoryModal({ isOpen, onClose }: { isOpen: boolean; onClose
   const getSaleItems = (saleId: string) => saleItems.filter(si => si.sale_id === saleId);
 
   const handleCancelSale = () => {
-    if (!selectedSale || !user) return;
+    if (!selectedSale || !user?.market_id || !user.branch_id) {
+      toast.error('هەژماری فرۆشگا/لق دیاری نەکراوە');
+      return;
+    }
     // Mark sale as cancelled (soft delete)
     const { sales: allSales } = useDataStore.getState();
     useDataStore.setState({
       sales: allSales.map(s => s.id === selectedSale.id ? { ...s, status: 'cancelled' as const, updated_at: new Date().toISOString() } : s),
     });
     addAuditLog({
-      market_id: 'market-1',
-      branch_id: 'branch-1',
+      market_id: user.market_id,
+      branch_id: user.branch_id,
       user_id: user.id,
       action: 'sales.cancelled',
       module: 'sales',

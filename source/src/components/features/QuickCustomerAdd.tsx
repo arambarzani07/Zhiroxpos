@@ -14,13 +14,17 @@ export function QuickCustomerAddModal({ isOpen, onClose, onCreated }: { isOpen: 
   const { user } = useAuthStore();
 
   const handleAdd = () => {
+    if (!user?.market_id || !user.branch_id) {
+      toast.error('هەژماری فرۆشگا/لق دیاری نەکراوە');
+      return;
+    }
     if (!name.trim()) return;
     const customer = addCustomer({
-      market_id: 'market-1', name: name.trim(), phone: phone.trim() || undefined,
-      status: 'active', created_by: user?.id || '',
+      market_id: user.market_id, name: name.trim(), phone: phone.trim() || undefined,
+      status: 'active', created_by: user.id,
     });
     if (user) {
-      addAuditLog({ market_id: 'market-1', user_id: user.id, action: 'customers.create', module: 'customers', table_name: 'customers', record_id: customer.id, new_value: { name: customer.name } as any });
+      addAuditLog({ market_id: user.market_id, user_id: user.id, action: 'customers.create', module: 'customers', table_name: 'customers', record_id: customer.id, new_value: { name: customer.name } as any });
     }
     toast.success(`${customer.name} زیادکرا`);
     onCreated(customer.id);
