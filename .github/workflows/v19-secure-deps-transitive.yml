@@ -1,0 +1,51 @@
+name: V19 Secure Transitive Dependencies
+
+on:
+  push:
+    branches:
+      - v19-production-readiness
+    paths:
+      - '.github/workflows/v19-secure-deps-transitive.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fix-transitives:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v19-production-readiness
+      - name: Pin patched direct versions
+        run: python3 tools/v19_bump_secure_deps.py
+      - name: Refresh dependency tree and apply non-force advisory fixes
+        working-directory: source
+        run: |
+          npm install --package-lock-only
+          npm ci
+          npm audit fix --package-lock-only || true
+          npm ci
+      - name: Block high vulnerabilities in runtime and build tree
+        working-directory: source
+        run: |
+          npm audit --omit=dev --audit-level=high
+          npm audit --audit-level=high
+      - name: Production gate and build
+        working-directory: source
+        run: |
+          npm run check:production
+          npx tsc --noEmit
+          npm run build
+      - name: Commit secure dependency tree
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add source/package.json source/package-lock.json
+          if git diff --cached --quiet; then
+            echo 'Dependency tree already secure.'
+            exit 0
+          fi
+          git commit -m 'Resolve v19 transitive dependency advisories'
+          git push origin HEAD:v19-production-readiness
