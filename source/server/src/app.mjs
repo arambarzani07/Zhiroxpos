@@ -24,12 +24,12 @@ const json = (res, status, payload, headers = {}) => {
   res.end(JSON.stringify(payload));
 };
 
-const readJson = req => new Promise((resolve, reject) => {
+const readJson = (req, maxBytes = JSON_LIMIT) => new Promise((resolve, reject) => {
   let bytes = 0;
   const chunks = [];
   req.on('data', chunk => {
     bytes += chunk.length;
-    if (bytes > JSON_LIMIT) {
+    if (bytes > maxBytes) {
       reject(Object.assign(new Error('PAYLOAD_TOO_LARGE'), { status: 413 }));
       req.destroy();
       return;
@@ -92,8 +92,9 @@ async function registeredDevice(client,user,req){
   const result=await client.query(`SELECT id,market_id,branch_id,status FROM devices WHERE id=$1 AND market_id=$2 AND branch_id=$3 AND status='active'`,[deviceId,user.market_id,user.branch_id]);
   return result.rows[0]||null;
 }
-async function lockBranchWriter(client,user){
-  await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[JSON.stringify([user.market_id,user.branch_id,'branch-writer'])]);
+async function lockBranchWriter(client,user,exclusive=false){
+  const fn=exclusive?'pg_advisory_xact_lock':'pg_advisory_xact_lock_shared';
+  await client.query(`SELECT ${fn}(hashtextextended($1,0))`,[JSON.stringify([user.market_id,user.branch_id,'branch-writer'])]);
 }
 async function activeOfflineLease(client,user){
   await client.query(`UPDATE offline_leases SET revoked_at=COALESCE(revoked_at,expires_at) WHERE market_id=$1 AND branch_id=$2 AND revoked_at IS NULL AND expires_at<=now()`,[user.market_id,user.branch_id]);
@@ -595,7 +596,7 @@ export function createHandler(pool, configInput = {}) {
         const deviceId=deviceIdFromRequest(req); const requestHash=sha256(JSON.stringify({deviceId,minutes,blockSize,date}));
         const result=await withTransaction(pool,async client=>{
           const device=await registeredDevice(client,user,req); if(!device)return {status:409,body:{error:'DEVICE_NOT_REGISTERED'}};
-          await lockBranchWriter(client,user); await lockIdempotency(client,user.market_id,'offline.lease.acquire',key);
+          await lockBranchWriter(client,user,true); await lockIdempotency(client,user.market_id,'offline.lease.acquire',key);
           const existingKey=await client.query(`SELECT request_hash,response_json FROM idempotency_keys WHERE market_id=$1 AND scope='offline.lease.acquire' AND idempotency_key=$2`,[user.market_id,key]);
           if(existingKey.rows[0]){if(existingKey.rows[0].request_hash!==requestHash)return {status:409,body:{error:'IDEMPOTENCY_CONFLICT'}};const meta=existingKey.rows[0].response_json;return {status:200,body:{...meta,lease_token:leaseToken(config.offlineLeaseSecret,meta.lease_id,meta.device_id,meta.expires_at)}};}
           const active=await activeOfflineLease(client,user); if(active)return {status:409,body:{error:'OFFLINE_LEASE_ALREADY_ACTIVE',device_id:active.device_id,expires_at:active.expires_at}};
@@ -609,7 +610,13 @@ export function createHandler(pool, configInput = {}) {
 
       if (req.method === 'POST' && url.pathname === '/api/v1/offline/lease/release') {
         const user=await authenticate(pool,req); if(!user)return json(res,401,{error:'AUTH_REQUIRED'}); if(!user.branch_id)return json(res,409,{error:'BRANCH_REQUIRED'}); const body=await readJson(req); const deviceId=deviceIdFromRequest(req);
-        const result=await withTransaction(pool,async client=>{await lockBranchWriter(client,user);const lease=await client.query(`SELECT id,device_id,expires_at FROM offline_leases WHERE id=$1 AND market_id=$2 AND branch_id=$3 FOR UPDATE`,[String(body.lease_id||''),user.market_id,user.branch_id]);if(!lease.rows[0]||lease.rows[0].device_id!==deviceId)return {status:404,body:{error:'OFFLINE_LEASE_NOT_FOUND'}};const expected=leaseToken(config.offlineLeaseSecret,lease.rows[0].id,deviceId,lease.rows[0].expires_at);if(!safeTokenEqual(expected,String(body.lease_token||'')))return {status:403,body:{error:'OFFLINE_LEASE_INVALID'}};await client.query('UPDATE offline_leases SET revoked_at=COALESCE(revoked_at,now()) WHERE id=$1',[lease.rows[0].id]);return {status:200,body:{ok:true}};}); return json(res,result.status,result.body);
+        const result=await withTransaction(pool,async client=>{await lockBranchWriter(client,user,true);const lease=await client.query(`SELECT id,device_id,expires_at FROM offline_leases WHERE id=$1 AND market_id=$2 AND branch_id=$3 FOR UPDATE`,[String(body.lease_id||''),user.market_id,user.branch_id]);if(!lease.rows[0]||lease.rows[0].device_id!==deviceId)return {status:404,body:{error:'OFFLINE_LEASE_NOT_FOUND'}};const expected=leaseToken(config.offlineLeaseSecret,lease.rows[0].id,deviceId,lease.rows[0].expires_at);if(!safeTokenEqual(expected,String(body.lease_token||'')))return {status:403,body:{error:'OFFLINE_LEASE_INVALID'}};await client.query('UPDATE offline_leases SET revoked_at=COALESCE(revoked_at,now()) WHERE id=$1',[lease.rows[0].id]);return {status:200,body:{ok:true}};}); return json(res,result.status,result.body);
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/v1/catalog/products/lookup') {
+        const user=await authenticate(pool,req);if(!user)return json(res,401,{error:'AUTH_REQUIRED'});const barcode=String(url.searchParams.get('barcode')||'').trim();if(!validBarcode(barcode))return json(res,422,{error:'INVALID_BARCODE'});
+        const result=await pool.query(`SELECT id,market_id,branch_id,category_id,barcode,barcodes,name,name_en,description,unit,cost_price_iqd,sale_price_iqd,currency,stock_quantity,low_stock_limit,image_url,is_trackable,status,version,created_at,updated_at FROM products WHERE market_id=$1 AND status='active' AND (barcode=$2 OR barcodes ? $2) ORDER BY (barcode=$2) DESC LIMIT 1`,[user.market_id,barcode]);
+        if(!result.rows[0])return json(res,404,{error:'PRODUCT_NOT_FOUND'});const row=result.rows[0];return json(res,200,{product:{...row,cost_price_iqd:Number(row.cost_price_iqd),sale_price_iqd:Number(row.sale_price_iqd),stock_quantity:Number(row.stock_quantity),low_stock_limit:Number(row.low_stock_limit),version:Number(row.version)}});
       }
 
       if (req.method === 'GET' && url.pathname === '/api/v1/catalog/products') {
@@ -643,7 +650,7 @@ export function createHandler(pool, configInput = {}) {
         if (!user.branch_id) return json(res, 409, { error: 'BRANCH_REQUIRED' });
         const key = String(req.headers['idempotency-key'] || '').trim();
         if (!key || key.length > 128) return json(res, 400, { error: 'IDEMPOTENCY_KEY_REQUIRED' });
-        const body = await readJson(req);
+        const body = await readJson(req, 2 * 1024 * 1024);
         if (!Array.isArray(body.items) || body.items.length < 1 || body.items.length > 500) return json(res, 422, { error: 'INVALID_IMPORT_BATCH' });
         const normalized = [];
         const seenBarcodes = new Set();
@@ -668,7 +675,7 @@ export function createHandler(pool, configInput = {}) {
         }
         const requestHash = sha256(JSON.stringify(normalized));
         const result = await withTransaction(pool, async client => {
-          await lockIdempotency(client, user.market_id, 'products.import', key);
+          const device=await registeredDevice(client,user,req); if(!device)return {status:409,body:{error:'DEVICE_NOT_REGISTERED'}}; await lockBranchWriter(client,user); const leaseGate=await enforceWriterLease(client,user,device.id); if(leaseGate)return {status:423,body:leaseGate}; await lockIdempotency(client, user.market_id, 'products.import', key);
           const existing = await client.query(
             `SELECT request_hash, response_json FROM idempotency_keys WHERE market_id=$1 AND scope='products.import' AND idempotency_key=$2`,
             [user.market_id, key]
@@ -729,7 +736,7 @@ export function createHandler(pool, configInput = {}) {
         if (!['owner','admin'].includes(user.role_type)) return json(res, 403, { error: 'PERMISSION_DENIED' });
         const key = String(req.headers['idempotency-key'] || '').trim();
         if (!key || key.length > 128) return json(res, 400, { error: 'IDEMPOTENCY_KEY_REQUIRED' });
-        const body = await readJson(req);
+        const body = await readJson(req, 2 * 1024 * 1024);
         if (!Array.isArray(body.items) || body.items.length < 1 || body.items.length > 500) return json(res, 422, { error: 'INVALID_IMPORT_BATCH' });
         const normalized = [];
         const seenCodes = new Set();
@@ -750,7 +757,7 @@ export function createHandler(pool, configInput = {}) {
         }
         const requestHash = sha256(JSON.stringify(normalized));
         const result = await withTransaction(pool, async client => {
-          await lockIdempotency(client, user.market_id, 'customers.import', key);
+          const device=await registeredDevice(client,user,req); if(!device)return {status:409,body:{error:'DEVICE_NOT_REGISTERED'}}; await lockBranchWriter(client,user); const leaseGate=await enforceWriterLease(client,user,device.id); if(leaseGate)return {status:423,body:leaseGate}; await lockIdempotency(client, user.market_id, 'customers.import', key);
           const existing = await client.query(`SELECT request_hash,response_json FROM idempotency_keys WHERE market_id=$1 AND scope='customers.import' AND idempotency_key=$2`, [user.market_id,key]);
           if (existing.rows[0]) {
             if (existing.rows[0].request_hash !== requestHash) return { status: 409, body: { error: 'IDEMPOTENCY_CONFLICT' } };
