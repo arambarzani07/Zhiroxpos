@@ -32,8 +32,10 @@ async function request(path, { method = 'GET', body, headers = {} } = {}) {
 before(async () => {
   const migration = await fs.readFile(new URL('../db/001_core.sql', import.meta.url), 'utf8');
   const financial = await fs.readFile(new URL('../db/002_financial.sql', import.meta.url), 'utf8');
+  const catalog = await fs.readFile(new URL('../db/003_catalog.sql', import.meta.url), 'utf8');
   await pool.query(migration);
   await pool.query(financial);
+  await pool.query(catalog);
   await pool.query('TRUNCATE journal_lines, journal_batches, stock_movements, payments, sale_items, sales, customer_balances, customers, products, idempotency_keys, receipt_sequences, auth_throttle, sessions, users, branches, markets CASCADE');
   const handler = createHandler(pool, {
     production: false,
@@ -314,4 +316,44 @@ test('concurrent identical idempotency retries commit exactly once', async () =>
   assert.equal(Number(stock.rows[0].stock_quantity), 1);
   const sales = await pool.query("SELECT count(*)::int AS count FROM sales WHERE client_operation_id = 'idem-race-operation-1'");
   assert.equal(sales.rows[0].count, 1);
+});
+
+
+test('catalog imports bind products to authenticated tenant and are idempotent', async () => {
+  const context = await pool.query('SELECT market_id,branch_id FROM users WHERE username=$1', ['owner']);
+  const { market_id: marketId, branch_id: branchId } = context.rows[0];
+  const body = { items: [{ id:'prod-import-1', market_id:'evil-market', branch_id:'evil-branch', barcode:'CAT-001', name:'Imported Product', cost_price_iqd:500, sale_price_iqd:1000, stock_quantity:7, low_stock_limit:2 }] };
+  const first = await request('/api/v1/catalog/products/import', { method:'POST', headers:{'idempotency-key':'product-import-key-1'}, body });
+  assert.equal(first.response.status,201);
+  assert.equal(first.json.imported,1);
+  const retry = await request('/api/v1/catalog/products/import', { method:'POST', headers:{'idempotency-key':'product-import-key-1'}, body });
+  assert.equal(retry.response.status,200);
+  assert.equal(retry.json.items[0].server_id,first.json.items[0].server_id);
+
+  const row = await pool.query("SELECT market_id,branch_id,stock_quantity FROM products WHERE barcode='CAT-001'");
+  assert.equal(row.rows[0].market_id,marketId);
+  assert.equal(row.rows[0].branch_id,branchId);
+  assert.equal(Number(row.rows[0].stock_quantity),7);
+
+  const conflict = await request('/api/v1/catalog/products/import', { method:'POST', headers:{'idempotency-key':'product-import-key-1'}, body:{items:[{...body.items[0],sale_price_iqd:1200}]} });
+  assert.equal(conflict.response.status,409);
+  assert.equal(conflict.json.error,'IDEMPOTENCY_CONFLICT');
+
+  const list = await request('/api/v1/catalog/products?limit=500');
+  assert.equal(list.response.status,200);
+  assert.ok(list.json.items.some(item => item.barcode === 'CAT-001' && item.market_id === marketId));
+});
+
+test('customer import creates authoritative opening balance and ignores injected tenant', async () => {
+  const context = await pool.query('SELECT market_id FROM users WHERE username=$1', ['owner']);
+  const marketId = context.rows[0].market_id;
+  const body = { items:[{ id:'cust-import-1', market_id:'evil-market', code:'C-IMPORT-1', name:'Imported Customer', debt_limit_iqd:5000, opening_balance_iqd:1250 }] };
+  const imported = await request('/api/v1/customers/import', { method:'POST', headers:{'idempotency-key':'customer-import-key-1'}, body });
+  assert.equal(imported.response.status,201);
+  const row = await pool.query("SELECT c.market_id,cb.balance_iqd FROM customers c JOIN customer_balances cb ON cb.customer_id=c.id AND cb.market_id=c.market_id WHERE c.code='C-IMPORT-1'");
+  assert.equal(row.rows[0].market_id,marketId);
+  assert.equal(Number(row.rows[0].balance_iqd),1250);
+  const list = await request('/api/v1/customers?limit=500');
+  assert.equal(list.response.status,200);
+  assert.ok(list.json.items.some(item => item.code === 'C-IMPORT-1' && item.balance_iqd === 1250));
 });
