@@ -37,12 +37,14 @@ before(async () => {
   const catalog = await fs.readFile(new URL('../db/003_catalog.sql', import.meta.url), 'utf8');
   const dailyAuthority = await fs.readFile(new URL('../db/004_daily_authority.sql', import.meta.url), 'utf8');
   const offlineLeases = await fs.readFile(new URL('../db/005_offline_leases.sql', import.meta.url), 'utf8');
+  const userManagement = await fs.readFile(new URL('../db/006_user_management.sql', import.meta.url), 'utf8');
   await pool.query(migration);
   await pool.query(financial);
   await pool.query(catalog);
   await pool.query(dailyAuthority);
   await pool.query(offlineLeases);
-  await pool.query('TRUNCATE receipt_blocks, offline_leases, devices, journal_lines, journal_batches, stock_movements, payments, sale_items, sales, customer_balances, customers, products, idempotency_keys, receipt_sequences, auth_throttle, sessions, users, branches, markets CASCADE');
+  await pool.query(userManagement);
+  await pool.query('TRUNCATE security_audit, receipt_blocks, offline_leases, devices, journal_lines, journal_batches, stock_movements, payments, sale_items, sales, customer_balances, customers, products, idempotency_keys, receipt_sequences, auth_throttle, sessions, users, branches, markets CASCADE');
   const handler = createHandler(pool, {
     production: false,
     bootstrapToken: 'integration-bootstrap-token',
@@ -426,4 +428,30 @@ test('offline receipt outside assigned block is rejected without stock mutation'
   const invalid=await request('/api/v1/sales/commit',{method:'POST',headers:{'idempotency-key':'offline-invalid-key'},body:{client_operation_id:'offline-invalid-operation',payment_method:'cash',paid_iqd:500,items:[{product_id:'lease-product',quantity:1}],offline_receipt:{lease_id:acquired.json.lease_id,lease_token:acquired.json.lease_token,block_id:acquired.json.block.id,receipt_number:receipt,business_date:'2026-08-12',sequence:seq,captured_at:new Date(acquired.json.starts_at).toISOString()}}});
   assert.equal(invalid.response.status,409); assert.equal(invalid.json.error,'OFFLINE_RECEIPT_BLOCK_INVALID'); const after=await pool.query("SELECT stock_quantity FROM products WHERE id='lease-product'"); assert.equal(Number(after.rows[0].stock_quantity),Number(before.rows[0].stock_quantity));
   await request('/api/v1/offline/lease/release',{method:'POST',body:{lease_id:acquired.json.lease_id,lease_token:acquired.json.lease_token}});
+});
+
+
+test('owner can create and block a cashier while server stores only a password hash', async () => {
+  const context=await pool.query('SELECT branch_id FROM users WHERE username=$1',['owner']); const branchId=context.rows[0].branch_id;
+  const created=await request('/api/v1/users/save',{method:'POST',body:{branch_id:branchId,username:'cashier19',full_name:'Cashier 19',role_type:'cashier',status:'active',password:'CashierPass19'}}); assert.equal(created.response.status,201); const cashier=created.json.user; assert.equal(cashier.version,1);
+  const stored=await pool.query('SELECT password_hash,password_salt FROM users WHERE id=$1',[cashier.id]); assert.notEqual(stored.rows[0].password_hash,'CashierPass19'); assert.ok(stored.rows[0].password_salt);
+  const ownerCookie=cookie; cookie=''; const cashierLogin=await request('/api/v1/login',{method:'POST',body:{username:'cashier19',password:'CashierPass19'}}); assert.equal(cashierLogin.response.status,200); const cashierCookie=cookie;
+  const forbidden=await request('/api/v1/users'); assert.equal(forbidden.response.status,403);
+  cookie=ownerCookie; const blocked=await request('/api/v1/users/save',{method:'POST',body:{id:cashier.id,version:1,branch_id:branchId,username:'cashier19',full_name:'Cashier 19',role_type:'cashier',status:'blocked'}}); assert.equal(blocked.response.status,200); assert.equal(blocked.json.user.version,2);
+  cookie=cashierCookie; const staleSession=await request('/api/v1/session'); assert.equal(staleSession.response.status,401); const blockedLogin=await request('/api/v1/login',{method:'POST',body:{username:'cashier19',password:'CashierPass19'}}); assert.equal(blockedLogin.response.status,401); cookie=ownerCookie;
+});
+
+test('stale user version is rejected and sole owner cannot demote or block self', async () => {
+  const owner=await pool.query("SELECT id,branch_id,username,full_name,version FROM users WHERE username='owner'"); const row=owner.rows[0];
+  const stale=await request('/api/v1/users/save',{method:'POST',body:{id:row.id,version:999,branch_id:row.branch_id,username:row.username,full_name:row.full_name,role_type:'owner',status:'active'}}); assert.equal(stale.response.status,409); assert.equal(stale.json.error,'VERSION_CONFLICT');
+  const selfBlock=await request('/api/v1/users/save',{method:'POST',body:{id:row.id,version:Number(row.version),branch_id:row.branch_id,username:row.username,full_name:row.full_name,role_type:'owner',status:'blocked'}}); assert.equal(selfBlock.response.status,409); assert.equal(selfBlock.json.error,'CANNOT_DEMOTE_OR_BLOCK_SELF');
+});
+
+test('password reset revokes active sessions and requires the new password', async () => {
+  const cashier=await pool.query("SELECT id FROM users WHERE username='cashier19'"); const id=cashier.rows[0].id; await pool.query("UPDATE users SET status='active' WHERE id=$1",[id]);
+  const ownerCookie=cookie; cookie=''; let login=await request('/api/v1/login',{method:'POST',body:{username:'cashier19',password:'CashierPass19'}}); assert.equal(login.response.status,200); const oldSession=cookie;
+  cookie=ownerCookie; const reset=await request('/api/v1/users/reset-password',{method:'POST',body:{user_id:id,new_password:'NewCashierPass20'}}); assert.equal(reset.response.status,200);
+  cookie=oldSession; const revoked=await request('/api/v1/session'); assert.equal(revoked.response.status,401);
+  cookie=''; const oldPassword=await request('/api/v1/login',{method:'POST',body:{username:'cashier19',password:'CashierPass19'}}); assert.equal(oldPassword.response.status,401); const newPassword=await request('/api/v1/login',{method:'POST',body:{username:'cashier19',password:'NewCashierPass20'}}); assert.equal(newPassword.response.status,200); cookie=ownerCookie;
+  const audit=await pool.query("SELECT action FROM security_audit WHERE target_id=$1 ORDER BY created_at",[id]); assert.ok(audit.rows.some(row=>row.action==='user.created')); assert.ok(audit.rows.some(row=>row.action==='user.password_reset'));
 });

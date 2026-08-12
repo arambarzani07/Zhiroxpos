@@ -19,6 +19,7 @@ import { CashSessionHistory } from '../components/features/CashSession';
 import { BackupRestoreWidget } from '../components/features/BackupRestore';
 import { AutoLockToggle } from '../components/features/InactivityLock';
 import { Database } from 'lucide-react';
+import { ServerUserManager } from '../components/features/ServerUserManager';
 
 type SettingsTab = 'general' | 'categories' | 'users' | 'roles' | 'receipt' | 'currency' | 'cashsession' | 'features' | 'backup';
 
@@ -125,17 +126,8 @@ export function SettingsPage() {
       case 'users':
         return (
           <Card>
-            <CardHeader title={translations.settings.users} subtitle="بەڕێوەبردنی بەکارهێنەر لە سێرڤەری Production" icon={<Users className="w-5 h-5" />} />
-            <div className="space-y-4">
-              <div className="p-4 rounded-xl border border-indigo-200 bg-indigo-50">
-                <p className="font-medium text-indigo-900">هەژماری چالاک</p>
-                <p className="text-sm text-indigo-700 mt-1">{currentUser?.full_name || '-'} • {currentUser?.username || '-'}</p>
-              </div>
-              <p className="text-sm text-slate-600 leading-7">
-                لە وەشانی Production هیچ وشەی نهێنی یان لیستی بەکارهێنەر لە localStorage ناپارێزرێت. زیادکردن، گۆڕینی ڕۆڵ و بلۆککردنی بەکارهێنەر تەنها لە API ـی پارێزراوی سێرڤەر جێبەجێ دەکرێت.
-              </p>
-              <Badge variant="warning">Server-authoritative only</Badge>
-            </div>
+            <CardHeader title={translations.settings.users} subtitle="بەڕێوەبردنی پارێزراوی بەکارهێنەر و session" icon={<Users className="w-5 h-5" />} />
+            <ServerUserManager />
           </Card>
         );
 

@@ -11,6 +11,7 @@ export interface ServerUser {
   role_type: ServerRole;
 }
 
+export interface ManagedServerUser {id:string;market_id:string;branch_id?:string;username:string;full_name:string;role_type:ServerRole;status:'active'|'inactive'|'blocked';last_login_at?:string|null;version:number;created_at:string;updated_at:string;}
 export interface ServerMarket {
   id: string;
   name: string;
@@ -142,6 +143,10 @@ export const serverApi = {
     const key=operationId('customer-save');
     return apiFetch<{customer:ServerCustomer}>('/api/v1/customers/save',{method:'POST',headers:{'idempotency-key':key},body:JSON.stringify(input)});
   },
+  loadUsers: () => apiFetch<{items:ManagedServerUser[]}>('/api/v1/users'),
+  saveUser: (input:Partial<ManagedServerUser>&{username:string;full_name:string;role_type:ServerRole;branch_id:string;password?:string}) => apiFetch<{user:ManagedServerUser}>('/api/v1/users/save',{method:'POST',body:JSON.stringify(input)}),
+  resetUserPassword: (userId:string,newPassword:string) => apiFetch<{ok:true}>('/api/v1/users/reset-password',{method:'POST',body:JSON.stringify({user_id:userId,new_password:newPassword})}),
+  revokeUserSessions: (userId:string) => apiFetch<{ok:true;revoked:number}>('/api/v1/users/revoke-sessions',{method:'POST',body:JSON.stringify({user_id:userId})}),
   registerDevice: () => apiFetch<{device_id:string;market_id:string;branch_id:string}>('/api/v1/devices/register',{method:'POST',body:JSON.stringify({device_id:getDeviceId(),label:getDeviceLabel()})}),
   acquireOfflineLease: (durationMinutes=30,blockSize=100) => {const key=operationId('lease-acquire');return apiFetch<OfflineLeaseGrant>('/api/v1/offline/lease/acquire',{method:'POST',headers:{'idempotency-key':key},body:JSON.stringify({duration_minutes:durationMinutes,block_size:blockSize})});},
   releaseOfflineLease: (leaseId:string,leaseToken:string) => apiFetch<{ok:true}>('/api/v1/offline/lease/release',{method:'POST',body:JSON.stringify({lease_id:leaseId,lease_token:leaseToken})}),

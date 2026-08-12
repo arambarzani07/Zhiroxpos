@@ -72,6 +72,13 @@ async function lockIdempotency(client, marketId, scope, key) {
 }
 
 
+const MANAGED_ROLES=new Set(['owner','admin','cashier','stock_staff','accountant']);
+async function writeSecurityAudit(client,user,action,targetType,targetId,metadata={}){
+  await client.query(`INSERT INTO security_audit (id,market_id,actor_user_id,action,target_type,target_id,metadata) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)`,[createId('sec-audit'),user.market_id,user.id,action,targetType,targetId||null,JSON.stringify(metadata)]);
+}
+async function activeOwnerCount(client,marketId){const result=await client.query(`SELECT count(*)::int AS count FROM users WHERE market_id=$1 AND role_type='owner' AND status='active'`,[marketId]);return result.rows[0].count;}
+
+
 const validDeviceId = value => /^[A-Za-z0-9._:-]{8,128}$/.test(String(value ?? ''));
 const deviceIdFromRequest = req => String(req.headers['x-device-id'] || '').trim();
 const leaseSignature = (secret, leaseId, deviceId, expiresAt) => createHmac('sha256', secret).update(JSON.stringify([leaseId,deviceId,new Date(expiresAt).toISOString()])).digest('base64url');
@@ -524,6 +531,48 @@ export function createHandler(pool, configInput = {}) {
           return {status:id?200:201,body:payload};
         });
         return json(res,result.status,result.body);
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/v1/users') {
+        const user=await authenticate(pool,req); if(!user)return json(res,401,{error:'AUTH_REQUIRED'}); if(user.role_type!=='owner')return json(res,403,{error:'PERMISSION_DENIED'});
+        const result=await pool.query(`SELECT id,market_id,branch_id,username,full_name,role_type,status,last_login_at,version,created_at,updated_at FROM users WHERE market_id=$1 ORDER BY created_at,id`,[user.market_id]);
+        return json(res,200,{items:result.rows.map(row=>({...row,version:Number(row.version)}))});
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/v1/users/save') {
+        const user=await authenticate(pool,req); if(!user)return json(res,401,{error:'AUTH_REQUIRED'}); if(user.role_type!=='owner')return json(res,403,{error:'PERMISSION_DENIED'});
+        const body=await readJson(req); const id=body.id?String(body.id):null; const username=normalizeUsername(body.username); const fullName=String(body.full_name||'').trim(); const role=String(body.role_type||''); const status=body.status==='blocked'?'blocked':body.status==='inactive'?'inactive':'active'; const branchId=String(body.branch_id||user.branch_id||''); const version=id?Number(body.version):null;
+        if((id&&(!validEntityId(id)||!Number.isSafeInteger(version)||version<1))||username.length<3||username.length>100||!fullName||fullName.length>300||!MANAGED_ROLES.has(role)||!validEntityId(branchId))return json(res,422,{error:'INVALID_USER'});
+        if(!id&&!validatePasswordPolicy(String(body.password||'')))return json(res,422,{error:'PASSWORD_POLICY'});
+        const result=await withTransaction(pool,async client=>{
+          await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[JSON.stringify([user.market_id,'users.manage'])]);
+          const branch=await client.query(`SELECT id FROM branches WHERE id=$1 AND market_id=$2 AND status='active'`,[branchId,user.market_id]); if(!branch.rows[0])return {status:409,body:{error:'BRANCH_UNAVAILABLE'}};
+          const duplicate=await client.query(`SELECT id FROM users WHERE market_id=$1 AND lower(username)=$2 AND ($3::text IS NULL OR id<>$3) LIMIT 1`,[user.market_id,username,id]); if(duplicate.rows[0])return {status:409,body:{error:'USERNAME_DUPLICATE'}};
+          if(!id){
+            const password=await derivePassword(String(body.password)); const newId=createId('user');
+            const saved=await client.query(`INSERT INTO users (id,market_id,branch_id,username,full_name,role_type,password_salt,password_hash,status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id,market_id,branch_id,username,full_name,role_type,status,last_login_at,version,created_at,updated_at`,[newId,user.market_id,branchId,username,fullName,role,password.saltHex,password.hashHex,status]);
+            await writeSecurityAudit(client,user,'user.created','user',newId,{username,role_type:role,status,branch_id:branchId}); return {status:201,body:{user:{...saved.rows[0],version:Number(saved.rows[0].version)}}};
+          }
+          const currentResult=await client.query(`SELECT id,role_type,status,version FROM users WHERE id=$1 AND market_id=$2 FOR UPDATE`,[id,user.market_id]); const current=currentResult.rows[0]; if(!current)return {status:404,body:{error:'USER_NOT_FOUND'}};
+          if(id===user.id&&(role!=='owner'||status!=='active'))return {status:409,body:{error:'CANNOT_DEMOTE_OR_BLOCK_SELF'}};
+          if(current.role_type==='owner'&&(role!=='owner'||status!=='active')&&(await activeOwnerCount(client,user.market_id))<=1)return {status:409,body:{error:'LAST_OWNER_REQUIRED'}};
+          const saved=await client.query(`UPDATE users SET branch_id=$1,username=$2,full_name=$3,role_type=$4,status=$5,version=version+1,updated_at=now() WHERE id=$6 AND market_id=$7 AND version=$8 RETURNING id,market_id,branch_id,username,full_name,role_type,status,last_login_at,version,created_at,updated_at`,[branchId,username,fullName,role,status,id,user.market_id,version]);
+          if(!saved.rows[0])return {status:409,body:{error:'VERSION_CONFLICT',current_version:Number(current.version)}};
+          if(current.role_type!==role||current.status!==status)await client.query('UPDATE sessions SET revoked_at=COALESCE(revoked_at,now()) WHERE user_id=$1',[id]);
+          await writeSecurityAudit(client,user,'user.updated','user',id,{role_type:role,status,branch_id:branchId}); return {status:200,body:{user:{...saved.rows[0],version:Number(saved.rows[0].version)}}};
+        }); return json(res,result.status,result.body);
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/v1/users/reset-password') {
+        const user=await authenticate(pool,req); if(!user)return json(res,401,{error:'AUTH_REQUIRED'}); if(user.role_type!=='owner')return json(res,403,{error:'PERMISSION_DENIED'});
+        const body=await readJson(req); const targetId=String(body.user_id||''); const password=String(body.new_password||''); if(!validEntityId(targetId)||!validatePasswordPolicy(password))return json(res,422,{error:'PASSWORD_POLICY'});
+        const result=await withTransaction(pool,async client=>{const target=await client.query('SELECT id FROM users WHERE id=$1 AND market_id=$2 FOR UPDATE',[targetId,user.market_id]);if(!target.rows[0])return {status:404,body:{error:'USER_NOT_FOUND'}};const derived=await derivePassword(password);await client.query('UPDATE users SET password_salt=$1,password_hash=$2,version=version+1,updated_at=now() WHERE id=$3',[derived.saltHex,derived.hashHex,targetId]);await client.query('UPDATE sessions SET revoked_at=COALESCE(revoked_at,now()) WHERE user_id=$1',[targetId]);await writeSecurityAudit(client,user,'user.password_reset','user',targetId,{});return {status:200,body:{ok:true}};});return json(res,result.status,result.body);
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/v1/users/revoke-sessions') {
+        const user=await authenticate(pool,req); if(!user)return json(res,401,{error:'AUTH_REQUIRED'}); if(user.role_type!=='owner')return json(res,403,{error:'PERMISSION_DENIED'});
+        const body=await readJson(req); const targetId=String(body.user_id||''); if(!validEntityId(targetId))return json(res,422,{error:'INVALID_USER'});
+        const result=await withTransaction(pool,async client=>{const target=await client.query('SELECT id FROM users WHERE id=$1 AND market_id=$2',[targetId,user.market_id]);if(!target.rows[0])return {status:404,body:{error:'USER_NOT_FOUND'}};const revoked=await client.query('UPDATE sessions SET revoked_at=COALESCE(revoked_at,now()) WHERE user_id=$1 AND revoked_at IS NULL RETURNING id',[targetId]);await writeSecurityAudit(client,user,'user.sessions_revoked','user',targetId,{sessions:revoked.rowCount||0});return {status:200,body:{ok:true,revoked:revoked.rowCount||0}};});return json(res,result.status,result.body);
       }
 
       if (req.method === 'POST' && url.pathname === '/api/v1/devices/register') {
