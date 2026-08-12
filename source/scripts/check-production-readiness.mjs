@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 
 const checks = [
-  ['src/stores/authStore.ts', ['MOCK_USERS', "password === '123456'", 'validatePassword']],
+  ['src/stores/authStore.ts', ['MOCK_USERS', "password === '123456'", 'validatePassword', 'passwordHash', 'passwordSalt', 'credentials:']],
   ['src/pages/Login.tsx', ['Demo Credentials', "setPassword('123456')", 'placeholder="123456"']],
   ['src/stores/dataStore.ts', ['Initial Mock Data', 'INITIAL_PRODUCTS', 'INITIAL_CUSTOMERS']],
 ];

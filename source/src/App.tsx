@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, Outlet } from 'react-router-dom';
 import { useAuthStore } from './stores/authStore';
 import { Layout } from './components/layout/Layout';
@@ -25,7 +26,9 @@ import { PERMISSIONS } from './constants/permissions';
 
 // Protected Route Component
 function ProtectedRoute() {
-  const { isAuthenticated } = useAuthStore();
+  const { isAuthenticated, isInitialized } = useAuthStore();
+
+  if (!isInitialized) return <div className="min-h-screen bg-slate-950 text-white flex items-center justify-center">پەیوەندی بە سێرڤەر...</div>;
 
   if (!isAuthenticated) {
     return <Navigate to="/login" replace />;
@@ -36,7 +39,9 @@ function ProtectedRoute() {
 
 // Public Route Component (redirects to dashboard if authenticated)
 function PublicRoute() {
-  const { isAuthenticated } = useAuthStore();
+  const { isAuthenticated, isInitialized } = useAuthStore();
+
+  if (!isInitialized) return <div className="min-h-screen bg-slate-950 text-white flex items-center justify-center">پەیوەندی بە سێرڤەر...</div>;
 
   if (isAuthenticated) {
     return <Navigate to="/dashboard" replace />;
@@ -63,6 +68,9 @@ function FeatureWidgets() {
 }
 
 function App() {
+  const initialize = useAuthStore(state => state.initialize);
+  useEffect(() => { void initialize(); }, [initialize]);
+
   return (
     <ThemeProvider>
       <BrowserRouter>

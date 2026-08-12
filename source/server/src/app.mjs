@@ -104,9 +104,15 @@ async function authenticate(pool, req) {
   const token = parseCookies(req.headers.cookie).zhirox_session;
   if (!token) return null;
   const result = await pool.query(
-    `SELECT u.id, u.market_id, u.branch_id, u.username, u.full_name, u.role_type, u.status, s.id AS session_id
+    `SELECT u.id, u.market_id, u.branch_id, u.username, u.full_name, u.role_type, u.status, s.id AS session_id,
+            m.name AS market_name, m.currency AS market_currency, m.status AS market_status,
+            m.created_at AS market_created_at, m.updated_at AS market_updated_at,
+            b.name AS branch_name, b.is_main AS branch_is_main, b.status AS branch_status,
+            b.created_at AS branch_created_at, b.updated_at AS branch_updated_at
        FROM sessions s
        JOIN users u ON u.id = s.user_id
+       JOIN markets m ON m.id = u.market_id
+       LEFT JOIN branches b ON b.id = u.branch_id
       WHERE s.token_hash = $1
         AND s.revoked_at IS NULL
         AND s.expires_at > now()
@@ -158,6 +164,27 @@ const publicUser = row => ({
   role_type: row.role_type,
 });
 
+const publicContext = row => ({
+  user: publicUser(row),
+  market: {
+    id: row.market_id,
+    name: row.market_name,
+    currency: row.market_currency,
+    status: row.market_status,
+    created_at: row.market_created_at,
+    updated_at: row.market_updated_at,
+  },
+  branch: row.branch_id ? {
+    id: row.branch_id,
+    market_id: row.market_id,
+    name: row.branch_name,
+    is_main: Boolean(row.branch_is_main),
+    status: row.branch_status,
+    created_at: row.branch_created_at,
+    updated_at: row.branch_updated_at,
+  } : null,
+});
+
 function assertOrigin(req, config) {
   if (!config.production || !config.appOrigin) return;
   const origin = req.headers.origin;
@@ -182,6 +209,11 @@ export function createHandler(pool, configInput = {}) {
       }
 
       if (req.method === 'POST') assertOrigin(req, config);
+
+      if (req.method === 'GET' && url.pathname === '/api/v1/bootstrap/status') {
+        const count = await pool.query('SELECT count(*)::int AS count FROM users');
+        return json(res, 200, { needs_bootstrap: count.rows[0].count === 0 });
+      }
 
       if (req.method === 'POST' && url.pathname === '/api/v1/bootstrap') {
         if (!config.bootstrapToken || req.headers['x-bootstrap-token'] !== config.bootstrapToken) {
@@ -219,7 +251,15 @@ export function createHandler(pool, configInput = {}) {
           );
           const user = { id: userId, market_id: marketId, branch_id: branchId, username, full_name: String(body.fullName).trim(), role_type: 'owner' };
           const session = await createSession(client, user, req, config);
-          return { status: 201, body: { user, created_at: now }, cookie: session.cookie };
+          return {
+            status: 201,
+            body: {
+              user,
+              market: { id: marketId, name: String(body.marketName).trim(), currency: 'IQD', status: 'active', created_at: now, updated_at: now },
+              branch: { id: branchId, market_id: marketId, name: String(body.branchName ?? 'لقی سەرەکی').trim(), is_main: true, status: 'active', created_at: now, updated_at: now },
+            },
+            cookie: session.cookie,
+          };
         });
         return json(res, result.status, result.body, result.cookie ? { 'set-cookie': result.cookie } : {});
       }
@@ -233,8 +273,15 @@ export function createHandler(pool, configInput = {}) {
           if (throttle.blocked) return { status: 429, body: { error: 'AUTH_TEMPORARILY_BLOCKED' } };
 
           const lookup = await client.query(
-            `SELECT id, market_id, branch_id, username, full_name, role_type, status, password_salt, password_hash
-               FROM users WHERE lower(username) = $1 LIMIT 1`,
+            `SELECT u.id, u.market_id, u.branch_id, u.username, u.full_name, u.role_type, u.status, u.password_salt, u.password_hash,
+                    m.name AS market_name, m.currency AS market_currency, m.status AS market_status,
+                    m.created_at AS market_created_at, m.updated_at AS market_updated_at,
+                    b.name AS branch_name, b.is_main AS branch_is_main, b.status AS branch_status,
+                    b.created_at AS branch_created_at, b.updated_at AS branch_updated_at
+               FROM users u
+               JOIN markets m ON m.id = u.market_id
+               LEFT JOIN branches b ON b.id = u.branch_id
+              WHERE lower(u.username) = $1 LIMIT 1`,
             [username]
           );
           const row = lookup.rows[0];
@@ -250,14 +297,14 @@ export function createHandler(pool, configInput = {}) {
           await client.query('DELETE FROM auth_throttle WHERE identifier_hash = $1', [identifierHash]);
           await client.query('UPDATE users SET last_login_at = now(), updated_at = now() WHERE id = $1', [row.id]);
           const session = await createSession(client, row, req, config);
-          return { status: 200, body: { user: publicUser(row) }, cookie: session.cookie };
+          return { status: 200, body: publicContext(row), cookie: session.cookie };
         });
         return json(res, result.status, result.body, result.cookie ? { 'set-cookie': result.cookie } : {});
       }
 
       if (req.method === 'GET' && url.pathname === '/api/v1/session') {
         const user = await authenticate(pool, req);
-        return user ? json(res, 200, { user: publicUser(user) }) : json(res, 401, { error: 'AUTH_REQUIRED' });
+        return user ? json(res, 200, publicContext(user)) : json(res, 401, { error: 'AUTH_REQUIRED' });
       }
 
       if (req.method === 'POST' && url.pathname === '/api/v1/logout') {

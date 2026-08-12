@@ -12,13 +12,13 @@ export function LoginPage() {
   const [confirmPassword, setConfirmPassword] = useState('');
   const [marketName, setMarketName] = useState('');
   const [fullName, setFullName] = useState('');
+  const [setupToken, setSetupToken] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
 
   const navigate = useNavigate();
-  const { login, bootstrapOwner, credentials } = useAuthStore();
-  const needsBootstrap = credentials.length === 0;
+  const { login, bootstrapOwner, needsBootstrap } = useAuthStore();
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -30,7 +30,7 @@ export function LoginPage() {
     setIsLoading(true);
     try {
       const result = needsBootstrap
-        ? await bootstrapOwner({ marketName, fullName, username, password })
+        ? await bootstrapOwner({ marketName, fullName, username, password, setupToken })
         : await login(username, password);
       if (result.success) {
         toast.success(needsBootstrap ? 'هەژماری خاوەن دروست کرا' : translations.success.login);
@@ -71,6 +71,11 @@ export function LoginPage() {
               <>
                 <Field icon={<Store className="w-5 h-5" />} label="ناوی فرۆشگا" value={marketName} onChange={setMarketName} autoComplete="organization" />
                 <Field icon={<User className="w-5 h-5" />} label="ناوی تەواوی خاوەن" value={fullName} onChange={setFullName} autoComplete="name" />
+                <div>
+                  <label className="block text-sm font-medium text-slate-200 mb-1.5">Setup token ی یەکەم جار</label>
+                  <input type="password" value={setupToken} onChange={event => setSetupToken(event.target.value)} className="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-xl text-white focus:outline-none focus:ring-2 focus:ring-indigo-500" required autoComplete="off" />
+                  <p className="text-xs text-slate-400 mt-1">تەنها لە یەکەم setup ـدا؛ token لە browser ناپارێزرێت.</p>
+                </div>
               </>
             )}
             <Field icon={<User className="w-5 h-5" />} label={translations.auth.username} value={username} onChange={setUsername} autoComplete="username" />
