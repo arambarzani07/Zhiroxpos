@@ -1,12 +1,13 @@
 {
   "name": "react-vite-tailwind",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.19.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "check:production": "node scripts/check-production-readiness.mjs"
   },
   "dependencies": {
     "@types/uuid": "^10.0.0",

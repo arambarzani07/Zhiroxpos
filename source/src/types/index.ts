@@ -289,7 +289,7 @@ export interface DailyReport {
 
 // ===== Audit =====
 export type AuditAction = 
-  | 'auth.login' | 'auth.logout' | 'auth.failed_login'
+  | 'auth.login' | 'auth.logout' | 'auth.failed_login' | 'auth.bootstrap'
   | 'products.create' | 'products.update' | 'products.price_change' | 'products.status_change'
   | 'customers.create' | 'customers.update' | 'customers.status_change'
   | 'sales.completed' | 'sales.cancelled'
