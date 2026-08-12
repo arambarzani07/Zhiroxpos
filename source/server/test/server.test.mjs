@@ -12,6 +12,7 @@ const pool = new Pool({ connectionString: DATABASE_URL, max: 6 });
 let server;
 let baseUrl;
 let cookie = '';
+let activeDeviceId = '';
 
 async function request(path, { method = 'GET', body, headers = {} } = {}) {
   const response = await fetch(`${baseUrl}${path}`, {
@@ -20,6 +21,7 @@ async function request(path, { method = 'GET', body, headers = {} } = {}) {
       origin: 'http://127.0.0.1',
       ...(body ? { 'content-type': 'application/json' } : {}),
       ...(cookie ? { cookie } : {}),
+      ...(activeDeviceId ? { 'x-device-id': activeDeviceId } : {}),
       ...headers,
     },
     body: body ? JSON.stringify(body) : undefined,
@@ -34,14 +36,17 @@ before(async () => {
   const financial = await fs.readFile(new URL('../db/002_financial.sql', import.meta.url), 'utf8');
   const catalog = await fs.readFile(new URL('../db/003_catalog.sql', import.meta.url), 'utf8');
   const dailyAuthority = await fs.readFile(new URL('../db/004_daily_authority.sql', import.meta.url), 'utf8');
+  const offlineLeases = await fs.readFile(new URL('../db/005_offline_leases.sql', import.meta.url), 'utf8');
   await pool.query(migration);
   await pool.query(financial);
   await pool.query(catalog);
   await pool.query(dailyAuthority);
-  await pool.query('TRUNCATE journal_lines, journal_batches, stock_movements, payments, sale_items, sales, customer_balances, customers, products, idempotency_keys, receipt_sequences, auth_throttle, sessions, users, branches, markets CASCADE');
+  await pool.query(offlineLeases);
+  await pool.query('TRUNCATE receipt_blocks, offline_leases, devices, journal_lines, journal_batches, stock_movements, payments, sale_items, sales, customer_balances, customers, products, idempotency_keys, receipt_sequences, auth_throttle, sessions, users, branches, markets CASCADE');
   const handler = createHandler(pool, {
     production: false,
     bootstrapToken: 'integration-bootstrap-token',
+    offlineLeaseSecret: 'integration-offline-lease-secret-which-is-not-production',
     timeZone: 'Asia/Baghdad',
   });
   server = http.createServer(handler);
@@ -93,6 +98,9 @@ test('server login uses protected credential and generic failures', async () => 
   result = await request('/api/v1/login', { method: 'POST', body: { username: 'owner', password: 'SecurePass9' } });
   assert.equal(result.response.status, 200);
   assert.ok(cookie.startsWith('zhirox_session='));
+  activeDeviceId = 'test-device-main-0001';
+  const registered = await request('/api/v1/devices/register', { method:'POST', body:{ device_id:activeDeviceId, label:'Main test POS' } });
+  assert.equal(registered.response.status,200);
 
   result = await request('/api/v1/session');
   assert.equal(result.response.status, 200);
@@ -386,4 +394,35 @@ test('sale response contains authoritative item pricing and stock-after', async 
   await pool.query(`INSERT INTO products (id,market_id,branch_id,barcode,name,cost_price_iqd,sale_price_iqd,stock_quantity) VALUES ('prod-response',$1,$2,'RESP-1','Response Product',300,777,5) ON CONFLICT (id) DO UPDATE SET sale_price_iqd=777,stock_quantity=5`,[marketId,branchId]);
   const sale=await request('/api/v1/sales/commit',{method:'POST',headers:{'idempotency-key':'response-sale-key'},body:{client_operation_id:'response-sale-operation',payment_method:'cash',paid_iqd:1554,items:[{product_id:'prod-response',quantity:2}]}});
   assert.equal(sale.response.status,201); assert.equal(sale.json.items[0].unit_price_iqd,777); assert.equal(sale.json.items[0].line_total_iqd,1554); assert.equal(sale.json.items[0].stock_after,3);
+});
+
+
+test('offline writer lease blocks a different device and reserves a unique receipt block', async () => {
+  const acquired=await request('/api/v1/offline/lease/acquire',{method:'POST',headers:{'idempotency-key':'lease-acquire-1'},body:{duration_minutes:30,block_size:20,business_date:'2026-08-12'}});
+  assert.equal(acquired.response.status,201); assert.equal(acquired.json.block.end_sequence-acquired.json.block.start_sequence+1,20); assert.ok(acquired.json.lease_token);
+  const retry=await request('/api/v1/offline/lease/acquire',{method:'POST',headers:{'idempotency-key':'lease-acquire-1'},body:{duration_minutes:30,block_size:20,business_date:'2026-08-12'}});
+  assert.equal(retry.response.status,200); assert.equal(retry.json.lease_id,acquired.json.lease_id); assert.equal(retry.json.lease_token,acquired.json.lease_token);
+
+  const mainDevice=activeDeviceId; activeDeviceId='test-device-other-0002';
+  const reg=await request('/api/v1/devices/register',{method:'POST',body:{device_id:activeDeviceId,label:'Other POS'}}); assert.equal(reg.response.status,200);
+  const context=await pool.query('SELECT market_id,branch_id FROM users WHERE username=$1',['owner']); const {market_id:marketId,branch_id:branchId}=context.rows[0];
+  await pool.query(`INSERT INTO products (id,market_id,branch_id,barcode,name,cost_price_iqd,sale_price_iqd,stock_quantity) VALUES ('lease-product',$1,$2,'LEASE-P','Lease Product',100,500,3) ON CONFLICT (id) DO UPDATE SET stock_quantity=3`,[marketId,branchId]);
+  const blocked=await request('/api/v1/sales/commit',{method:'POST',headers:{'idempotency-key':'blocked-other-sale'},body:{client_operation_id:'blocked-other-operation',payment_method:'cash',paid_iqd:500,items:[{product_id:'lease-product',quantity:1}]}});
+  assert.equal(blocked.response.status,423); assert.equal(blocked.json.error,'BRANCH_OFFLINE_LEASE_ACTIVE');
+  activeDeviceId=mainDevice;
+
+  const seq=acquired.json.block.start_sequence; const receipt=`${acquired.json.block.receipt_prefix}-20260812-${String(seq).padStart(6,'0')}`;
+  const offlineBody={client_operation_id:'offline-operation-1',payment_method:'cash',paid_iqd:500,items:[{product_id:'lease-product',quantity:1}],offline_receipt:{lease_id:acquired.json.lease_id,lease_token:acquired.json.lease_token,block_id:acquired.json.block.id,receipt_number:receipt,business_date:'2026-08-12',sequence:seq,captured_at:new Date(acquired.json.starts_at).toISOString()}};
+  const offline=await request('/api/v1/sales/commit',{method:'POST',headers:{'idempotency-key':'offline-sale-key-1'},body:offlineBody}); assert.equal(offline.response.status,201); assert.equal(offline.json.receipt_number,receipt);
+  const release=await request('/api/v1/offline/lease/release',{method:'POST',body:{lease_id:acquired.json.lease_id,lease_token:acquired.json.lease_token}}); assert.equal(release.response.status,200);
+  const stock=await pool.query("SELECT stock_quantity FROM products WHERE id='lease-product'"); assert.equal(Number(stock.rows[0].stock_quantity),2);
+});
+
+test('offline receipt outside assigned block is rejected without stock mutation', async () => {
+  const acquired=await request('/api/v1/offline/lease/acquire',{method:'POST',headers:{'idempotency-key':'lease-acquire-2'},body:{duration_minutes:30,block_size:10,business_date:'2026-08-12'}}); assert.equal(acquired.response.status,201);
+  const before=await pool.query("SELECT stock_quantity FROM products WHERE id='lease-product'");
+  const seq=acquired.json.block.end_sequence+1; const receipt=`${acquired.json.block.receipt_prefix}-20260812-${String(seq).padStart(6,'0')}`;
+  const invalid=await request('/api/v1/sales/commit',{method:'POST',headers:{'idempotency-key':'offline-invalid-key'},body:{client_operation_id:'offline-invalid-operation',payment_method:'cash',paid_iqd:500,items:[{product_id:'lease-product',quantity:1}],offline_receipt:{lease_id:acquired.json.lease_id,lease_token:acquired.json.lease_token,block_id:acquired.json.block.id,receipt_number:receipt,business_date:'2026-08-12',sequence:seq,captured_at:new Date(acquired.json.starts_at).toISOString()}}});
+  assert.equal(invalid.response.status,409); assert.equal(invalid.json.error,'OFFLINE_RECEIPT_BLOCK_INVALID'); const after=await pool.query("SELECT stock_quantity FROM products WHERE id='lease-product'"); assert.equal(Number(after.rows[0].stock_quantity),Number(before.rows[0].stock_quantity));
+  await request('/api/v1/offline/lease/release',{method:'POST',body:{lease_id:acquired.json.lease_id,lease_token:acquired.json.lease_token}});
 });

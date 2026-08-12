@@ -5,6 +5,7 @@ import { createHandler } from './app.mjs';
 const { Pool } = pg;
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
 if (process.env.NODE_ENV === 'production' && !process.env.BOOTSTRAP_TOKEN) throw new Error('BOOTSTRAP_TOKEN is required in production until bootstrap is disabled');
+if (process.env.NODE_ENV === 'production' && !process.env.OFFLINE_LEASE_SECRET) throw new Error('OFFLINE_LEASE_SECRET is required in production');
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: Number(process.env.DB_POOL_SIZE || 10) });
 const handler = createHandler(pool);

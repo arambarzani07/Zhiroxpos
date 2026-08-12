@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import {
   clearSessionCookie,
   createId,
@@ -71,6 +71,54 @@ async function lockIdempotency(client, marketId, scope, key) {
   await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [JSON.stringify([marketId, scope, key])]);
 }
 
+
+const validDeviceId = value => /^[A-Za-z0-9._:-]{8,128}$/.test(String(value ?? ''));
+const deviceIdFromRequest = req => String(req.headers['x-device-id'] || '').trim();
+const leaseSignature = (secret, leaseId, deviceId, expiresAt) => createHmac('sha256', secret).update(JSON.stringify([leaseId,deviceId,new Date(expiresAt).toISOString()])).digest('base64url');
+const leaseToken = (secret, leaseId, deviceId, expiresAt) => `${leaseId}.${leaseSignature(secret,leaseId,deviceId,expiresAt)}`;
+const safeTokenEqual = (left,right) => { const a=Buffer.from(String(left)); const b=Buffer.from(String(right)); return a.length===b.length && timingSafeEqual(a,b); };
+const sqlDateString = value => value instanceof Date ? value.toISOString().slice(0,10) : String(value ?? '').slice(0,10);
+
+async function registeredDevice(client,user,req){
+  const deviceId=deviceIdFromRequest(req);
+  if(!validDeviceId(deviceId)) return null;
+  const result=await client.query(`SELECT id,market_id,branch_id,status FROM devices WHERE id=$1 AND market_id=$2 AND branch_id=$3 AND status='active'`,[deviceId,user.market_id,user.branch_id]);
+  return result.rows[0]||null;
+}
+async function lockBranchWriter(client,user){
+  await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[JSON.stringify([user.market_id,user.branch_id,'branch-writer'])]);
+}
+async function activeOfflineLease(client,user){
+  await client.query(`UPDATE offline_leases SET revoked_at=COALESCE(revoked_at,expires_at) WHERE market_id=$1 AND branch_id=$2 AND revoked_at IS NULL AND expires_at<=now()`,[user.market_id,user.branch_id]);
+  const result=await client.query(`SELECT id,device_id,starts_at,expires_at,revoked_at FROM offline_leases WHERE market_id=$1 AND branch_id=$2 AND revoked_at IS NULL AND expires_at>now() ORDER BY starts_at DESC LIMIT 1`,[user.market_id,user.branch_id]);
+  return result.rows[0]||null;
+}
+async function enforceWriterLease(client,user,deviceId){
+  const lease=await activeOfflineLease(client,user);
+  if(lease && lease.device_id!==deviceId) return {error:'BRANCH_OFFLINE_LEASE_ACTIVE',lease_expires_at:lease.expires_at};
+  return null;
+}
+async function allocateReceiptBlock(client,user,deviceId,leaseId,date,size){
+  const branch=await client.query(`SELECT receipt_prefix FROM branches WHERE id=$1 AND market_id=$2 AND status='active'`,[user.branch_id,user.market_id]);
+  if(!branch.rows[0]) throw Object.assign(new Error('BRANCH_UNAVAILABLE'),{status:409});
+  const seq=await client.query(`INSERT INTO receipt_sequences (market_id,branch_id,business_date,last_value) VALUES ($1,$2,$3::date,$4) ON CONFLICT (market_id,branch_id,business_date) DO UPDATE SET last_value=receipt_sequences.last_value+$4 RETURNING last_value`,[user.market_id,user.branch_id,date,size]);
+  const end=Number(seq.rows[0].last_value),start=end-size+1,prefix=branch.rows[0].receipt_prefix,id=createId('receipt-block');
+  await client.query(`INSERT INTO receipt_blocks (id,market_id,branch_id,device_id,lease_id,business_date,receipt_prefix,start_sequence,end_sequence) VALUES ($1,$2,$3,$4,$5,$6::date,$7,$8,$9)`,[id,user.market_id,user.branch_id,deviceId,leaseId,date,prefix,start,end]);
+  return {id,business_date:date,receipt_prefix:prefix,start_sequence:start,end_sequence:end};
+}
+async function validateOfflineReceipt(client,user,deviceId,offline,secret){
+  if(!offline||!secret||!validEntityId(offline.lease_id)||!validDate(offline.business_date)||!Number.isSafeInteger(Number(offline.sequence))) return {error:'INVALID_OFFLINE_RECEIPT'};
+  const leaseResult=await client.query(`SELECT id,device_id,starts_at,expires_at,revoked_at FROM offline_leases WHERE id=$1 AND market_id=$2 AND branch_id=$3`,[String(offline.lease_id),user.market_id,user.branch_id]);
+  const lease=leaseResult.rows[0]; if(!lease||lease.device_id!==deviceId)return {error:'OFFLINE_LEASE_INVALID'};
+  const expected=leaseToken(secret,lease.id,deviceId,lease.expires_at); if(!safeTokenEqual(expected,String(offline.lease_token||'')))return {error:'OFFLINE_LEASE_INVALID'};
+  const captured=new Date(String(offline.captured_at||'')); if(Number.isNaN(captured.getTime())||captured<new Date(lease.starts_at)||captured>new Date(lease.expires_at)||(lease.revoked_at&&captured>new Date(lease.revoked_at)))return {error:'OFFLINE_CAPTURE_OUTSIDE_LEASE'};
+  const blockResult=await client.query(`SELECT id,receipt_prefix,start_sequence,end_sequence,business_date FROM receipt_blocks WHERE id=$1 AND lease_id=$2 AND device_id=$3 AND market_id=$4 AND branch_id=$5`,[String(offline.block_id),lease.id,deviceId,user.market_id,user.branch_id]);
+  const block=blockResult.rows[0]; const sequence=Number(offline.sequence); if(!block||sqlDateString(block.business_date)!==String(offline.business_date)||sequence<Number(block.start_sequence)||sequence>Number(block.end_sequence))return {error:'OFFLINE_RECEIPT_BLOCK_INVALID'};
+  const receiptNumber=`${block.receipt_prefix}-${String(offline.business_date).replaceAll('-','')}-${String(sequence).padStart(6,'0')}`;
+  if(receiptNumber!==String(offline.receipt_number||''))return {error:'OFFLINE_RECEIPT_NUMBER_INVALID'};
+  return {receiptNumber};
+}
+
 const validPaymentMethod = value => ['cash', 'card', 'bank', 'debt', 'mixed'].includes(String(value ?? ''));
 
 const stableSaleHash = body => sha256(JSON.stringify({
@@ -81,6 +129,7 @@ const stableSaleHash = body => sha256(JSON.stringify({
   paid_iqd: body.paid_iqd,
   discount_iqd: body.discount_iqd || 0,
   items: [...body.items].map(item => ({ product_id: item.product_id, quantity: Number(item.quantity) })).sort((a, b) => a.product_id.localeCompare(b.product_id)),
+  offline_receipt: body.offline_receipt ? { lease_id:body.offline_receipt.lease_id, block_id:body.offline_receipt.block_id, receipt_number:body.offline_receipt.receipt_number, sequence:Number(body.offline_receipt.sequence), business_date:body.offline_receipt.business_date, captured_at:body.offline_receipt.captured_at } : null,
 }));
 
 async function nextReceipt(client, user, date) {
@@ -249,6 +298,7 @@ export function createHandler(pool, configInput = {}) {
     bootstrapToken: configInput.bootstrapToken ?? process.env.BOOTSTRAP_TOKEN ?? '',
     timeZone: configInput.timeZone ?? process.env.MARKET_TIME_ZONE ?? 'Asia/Baghdad',
     trustProxy: configInput.trustProxy ?? process.env.TRUST_PROXY === '1',
+    offlineLeaseSecret: configInput.offlineLeaseSecret ?? process.env.OFFLINE_LEASE_SECRET ?? '',
   };
 
   return async function handler(req, res) {
@@ -394,7 +444,7 @@ export function createHandler(pool, configInput = {}) {
         };
         const requestHash = sha256(JSON.stringify(normalized));
         const result = await withTransaction(pool, async client => {
-          await lockIdempotency(client, user.market_id, 'products.save', key);
+          const device=await registeredDevice(client,user,req); if(!device)return {status:409,body:{error:'DEVICE_NOT_REGISTERED'}}; await lockBranchWriter(client,user); const leaseGate=await enforceWriterLease(client,user,device.id); if(leaseGate)return {status:423,body:leaseGate}; await lockIdempotency(client, user.market_id, 'products.save', key);
           const existing = await client.query(`SELECT request_hash,response_json FROM idempotency_keys WHERE market_id=$1 AND scope='products.save' AND idempotency_key=$2`, [user.market_id,key]);
           if (existing.rows[0]) {
             if (existing.rows[0].request_hash !== requestHash) return { status:409, body:{error:'IDEMPOTENCY_CONFLICT'} };
@@ -455,7 +505,7 @@ export function createHandler(pool, configInput = {}) {
         const normalized = { id,name,code,phone:body.phone?String(body.phone).slice(0,100):null,address:body.address?String(body.address).slice(0,1000):null,notes:body.notes?String(body.notes).slice(0,2000):null,debt_limit_iqd:debtLimit,status:body.status==='blocked'?'blocked':'active',version };
         const requestHash = sha256(JSON.stringify(normalized));
         const result = await withTransaction(pool,async client=>{
-          await lockIdempotency(client,user.market_id,'customers.save',key);
+          const device=await registeredDevice(client,user,req); if(!device)return {status:409,body:{error:'DEVICE_NOT_REGISTERED'}}; await lockBranchWriter(client,user); const leaseGate=await enforceWriterLease(client,user,device.id); if(leaseGate)return {status:423,body:leaseGate}; await lockIdempotency(client,user.market_id,'customers.save',key);
           const existing=await client.query(`SELECT request_hash,response_json FROM idempotency_keys WHERE market_id=$1 AND scope='customers.save' AND idempotency_key=$2`,[user.market_id,key]);
           if(existing.rows[0]){ if(existing.rows[0].request_hash!==requestHash)return {status:409,body:{error:'IDEMPOTENCY_CONFLICT'}}; return {status:200,body:existing.rows[0].response_json}; }
           const codeConflict=await client.query('SELECT id FROM customers WHERE market_id=$1 AND code=$2 AND ($3::text IS NULL OR id<>$3) LIMIT 1',[user.market_id,code,id]);
@@ -474,6 +524,43 @@ export function createHandler(pool, configInput = {}) {
           return {status:id?200:201,body:payload};
         });
         return json(res,result.status,result.body);
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/v1/devices/register') {
+        const user=await authenticate(pool,req); if(!user)return json(res,401,{error:'AUTH_REQUIRED'}); if(!user.branch_id)return json(res,409,{error:'BRANCH_REQUIRED'});
+        const body=await readJson(req); const deviceId=String(body.device_id||'').trim(); const label=String(body.label||'POS Device').trim().slice(0,200);
+        if(!validDeviceId(deviceId)||!label)return json(res,422,{error:'INVALID_DEVICE'});
+        const result=await withTransaction(pool,async client=>{
+          const existing=await client.query('SELECT market_id,branch_id,status FROM devices WHERE id=$1 FOR UPDATE',[deviceId]);
+          if(existing.rows[0]&&(existing.rows[0].market_id!==user.market_id||existing.rows[0].branch_id!==user.branch_id))return {status:409,body:{error:'DEVICE_ID_CONFLICT'}};
+          await client.query(`INSERT INTO devices (id,market_id,branch_id,label,registered_by,last_seen_at) VALUES ($1,$2,$3,$4,$5,now()) ON CONFLICT (id) DO UPDATE SET label=EXCLUDED.label,last_seen_at=now(),status='active'`,[deviceId,user.market_id,user.branch_id,label,user.id]);
+          return {status:200,body:{device_id:deviceId,market_id:user.market_id,branch_id:user.branch_id}};
+        }); return json(res,result.status,result.body);
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/v1/offline/lease/acquire') {
+        const user=await authenticate(pool,req); if(!user)return json(res,401,{error:'AUTH_REQUIRED'}); if(!['owner','admin','cashier'].includes(user.role_type))return json(res,403,{error:'PERMISSION_DENIED'}); if(!user.branch_id)return json(res,409,{error:'BRANCH_REQUIRED'});
+        if(!config.offlineLeaseSecret)return json(res,503,{error:'OFFLINE_LEASE_NOT_CONFIGURED'});
+        const key=String(req.headers['idempotency-key']||'').trim(); if(!key||key.length>128)return json(res,400,{error:'IDEMPOTENCY_KEY_REQUIRED'});
+        const body=await readJson(req); const minutes=Math.min(240,Math.max(5,Number.parseInt(String(body.duration_minutes||30),10)||30)); const blockSize=Math.min(500,Math.max(10,Number.parseInt(String(body.block_size||100),10)||100)); const date=body.business_date?String(body.business_date):businessDate(config.timeZone); if(!validDate(date))return json(res,422,{error:'INVALID_BUSINESS_DATE'});
+        const deviceId=deviceIdFromRequest(req); const requestHash=sha256(JSON.stringify({deviceId,minutes,blockSize,date}));
+        const result=await withTransaction(pool,async client=>{
+          const device=await registeredDevice(client,user,req); if(!device)return {status:409,body:{error:'DEVICE_NOT_REGISTERED'}};
+          await lockBranchWriter(client,user); await lockIdempotency(client,user.market_id,'offline.lease.acquire',key);
+          const existingKey=await client.query(`SELECT request_hash,response_json FROM idempotency_keys WHERE market_id=$1 AND scope='offline.lease.acquire' AND idempotency_key=$2`,[user.market_id,key]);
+          if(existingKey.rows[0]){if(existingKey.rows[0].request_hash!==requestHash)return {status:409,body:{error:'IDEMPOTENCY_CONFLICT'}};const meta=existingKey.rows[0].response_json;return {status:200,body:{...meta,lease_token:leaseToken(config.offlineLeaseSecret,meta.lease_id,meta.device_id,meta.expires_at)}};}
+          const active=await activeOfflineLease(client,user); if(active)return {status:409,body:{error:'OFFLINE_LEASE_ALREADY_ACTIVE',device_id:active.device_id,expires_at:active.expires_at}};
+          const leaseId=createId('offline-lease'),starts=new Date(),expires=new Date(starts.getTime()+minutes*60_000);
+          await client.query(`INSERT INTO offline_leases (id,market_id,branch_id,device_id,starts_at,expires_at,created_by) VALUES ($1,$2,$3,$4,$5,$6,$7)`,[leaseId,user.market_id,user.branch_id,deviceId,starts,expires,user.id]);
+          const block=await allocateReceiptBlock(client,user,deviceId,leaseId,date,blockSize); const meta={lease_id:leaseId,device_id:deviceId,starts_at:starts.toISOString(),expires_at:expires.toISOString(),block};
+          await client.query(`INSERT INTO idempotency_keys (market_id,scope,idempotency_key,request_hash,response_json,user_id) VALUES ($1,'offline.lease.acquire',$2,$3,$4::jsonb,$5)`,[user.market_id,key,requestHash,JSON.stringify(meta),user.id]);
+          return {status:201,body:{...meta,lease_token:leaseToken(config.offlineLeaseSecret,leaseId,deviceId,expires)}};
+        }); return json(res,result.status,result.body);
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/v1/offline/lease/release') {
+        const user=await authenticate(pool,req); if(!user)return json(res,401,{error:'AUTH_REQUIRED'}); if(!user.branch_id)return json(res,409,{error:'BRANCH_REQUIRED'}); const body=await readJson(req); const deviceId=deviceIdFromRequest(req);
+        const result=await withTransaction(pool,async client=>{await lockBranchWriter(client,user);const lease=await client.query(`SELECT id,device_id,expires_at FROM offline_leases WHERE id=$1 AND market_id=$2 AND branch_id=$3 FOR UPDATE`,[String(body.lease_id||''),user.market_id,user.branch_id]);if(!lease.rows[0]||lease.rows[0].device_id!==deviceId)return {status:404,body:{error:'OFFLINE_LEASE_NOT_FOUND'}};const expected=leaseToken(config.offlineLeaseSecret,lease.rows[0].id,deviceId,lease.rows[0].expires_at);if(!safeTokenEqual(expected,String(body.lease_token||'')))return {status:403,body:{error:'OFFLINE_LEASE_INVALID'}};await client.query('UPDATE offline_leases SET revoked_at=COALESCE(revoked_at,now()) WHERE id=$1',[lease.rows[0].id]);return {status:200,body:{ok:true}};}); return json(res,result.status,result.body);
       }
 
       if (req.method === 'GET' && url.pathname === '/api/v1/catalog/products') {
@@ -670,6 +757,10 @@ export function createHandler(pool, configInput = {}) {
         const date = businessDate(config.timeZone);
 
         const result = await withTransaction(pool, async client => {
+          const device=await registeredDevice(client,user,req); if(!device)return {status:409,body:{error:'DEVICE_NOT_REGISTERED'}};
+          await lockBranchWriter(client,user);
+          const offlineReceipt=body.offline_receipt||null;
+          if(!offlineReceipt){const leaseGate=await enforceWriterLease(client,user,device.id);if(leaseGate)return {status:423,body:leaseGate};}
           await client.query(
             'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
             [JSON.stringify([user.market_id, 'sale.commit', idempotencyKey])]
@@ -760,7 +851,8 @@ export function createHandler(pool, configInput = {}) {
             }
           }
 
-          const { receiptNumber } = await nextReceipt(client, user, date);
+          let receiptNumber;
+          if(offlineReceipt){const verified=await validateOfflineReceipt(client,user,device.id,offlineReceipt,config.offlineLeaseSecret);if(verified.error)return {status:409,body:{error:verified.error}};receiptNumber=verified.receiptNumber;}else{receiptNumber=(await nextReceipt(client,user,date)).receiptNumber;}
           const saleId = createId('sale');
           await client.query(
             `INSERT INTO sales (id, market_id, branch_id, receipt_number, cashier_id, customer_id, client_operation_id, payment_method, subtotal_iqd, discount_iqd, total_iqd, paid_iqd, debt_iqd)
