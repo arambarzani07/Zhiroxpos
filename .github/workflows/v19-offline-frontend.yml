@@ -1,0 +1,93 @@
+name: V19 Offline Frontend Queue and Lease
+
+on:
+  push:
+    branches:
+      - v19-production-readiness
+    paths:
+      - 'tools/v19_wire_offline_frontend.py'
+      - '.github/workflows/v19-offline-frontend.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  offline-frontend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: zhirox
+          POSTGRES_PASSWORD: zhirox_test_password
+          POSTGRES_DB: zhirox_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zhirox -d zhirox_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://zhirox:zhirox_test_password@127.0.0.1:5432/zhirox_test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v19-production-readiness
+      - name: Generate IndexedDB offline queue and lease UI
+        run: python3 tools/v19_wire_offline_frontend.py
+      - name: Syntax-check server
+        working-directory: source/server
+        run: node --check src/app.mjs
+      - name: Install and audit server
+        working-directory: source/server
+        run: |
+          npm ci
+          npm audit --omit=dev --audit-level=high
+      - name: Run PostgreSQL offline, financial, catalog, CRUD and race tests
+        working-directory: source/server
+        run: npm test
+      - name: Install frontend
+        working-directory: source
+        run: npm ci
+      - name: Offline production authority gates
+        working-directory: source
+        run: |
+          npm run check:production
+          if grep -n -E "completeSale\(user\.id\)|generateReceiptNumber\(\)" src/pages/POS.tsx; then
+            echo 'Local POS financial or receipt authority remains in the active POS page.'
+            exit 1
+          fi
+          if ! grep -q "reserveOfflineReceipt" src/pages/POS.tsx; then
+            echo 'Offline receipt reservation is not wired into POS.'
+            exit 1
+          fi
+          if ! grep -q "serverApi.commitSale" src/pages/POS.tsx; then
+            echo 'Authoritative sale commit is not wired into POS.'
+            exit 1
+          fi
+          if grep -n -E "localStorage.*(offline.*sale|sale.*queue|pending.*sale)" src/services/offlineQueue.ts; then
+            echo 'Financial offline queue must use IndexedDB, not localStorage.'
+            exit 1
+          fi
+          if grep -n "Math.random" src/services/deviceIdentity.ts src/services/offlineQueue.ts src/services/serverApi.ts; then
+            echo 'Secure device/operation identifiers must not fall back to Math.random.'
+            exit 1
+          fi
+      - name: TypeScript and production build
+        working-directory: source
+        run: |
+          npx tsc --noEmit
+          npm run build
+      - name: Commit verified offline frontend wiring
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add source/src source/server
+          if git diff --cached --quiet; then
+            echo 'Offline frontend wiring already committed.'
+            exit 0
+          fi
+          git commit -m 'Wire v19 IndexedDB offline queue and device lease controls'
+          git push origin HEAD:v19-production-readiness
