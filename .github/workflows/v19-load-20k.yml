@@ -1,0 +1,78 @@
+name: V19 20K Product and Concurrent Cashier Load
+
+on:
+  push:
+    branches:
+      - v19-production-readiness
+    paths:
+      - 'tools/v19_add_20k_load_test.py'
+      - '.github/workflows/v19-load-20k.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  load-20k:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: zhirox
+          POSTGRES_PASSWORD: zhirox_test_password
+          POSTGRES_DB: zhirox_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zhirox -d zhirox_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://zhirox:zhirox_test_password@127.0.0.1:5432/zhirox_test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v19-production-readiness
+      - name: Generate load-test hardening
+        run: python3 tools/v19_add_20k_load_test.py
+      - name: Syntax-check server
+        working-directory: source/server
+        run: node --check src/app.mjs
+      - name: Install and audit server
+        working-directory: source/server
+        run: |
+          npm ci
+          npm audit --omit=dev --audit-level=high
+      - name: Run normal PostgreSQL regression suite
+        working-directory: source/server
+        run: npm test
+      - name: Run 20,000 product migration and 100-cashier-operation load test
+        working-directory: source/server
+        run: node test/load-20k.mjs
+      - name: Revalidate frontend production gates
+        working-directory: source
+        run: |
+          npm ci
+          npm run check:production
+          npx tsc --noEmit
+          npm run build
+      - name: Concurrency and import guards
+        working-directory: source/server
+        run: |
+          grep -q "pg_advisory_xact_lock_shared" src/app.mjs
+          grep -q "2 \* 1024 \* 1024" src/app.mjs
+          grep -q "products/lookup" src/app.mjs
+      - name: Commit verified load hardening
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add source/server
+          if git diff --cached --quiet; then
+            echo '20k load hardening already committed.'
+            exit 0
+          fi
+          git commit -m 'Harden v19 for 20k products and concurrent online cashiers'
+          git push origin HEAD:v19-production-readiness
