@@ -1,0 +1,52 @@
+name: V19 Tenant and UI Hardening Retry
+
+on:
+  push:
+    branches:
+      - v19-production-readiness
+    paths:
+      - 'tools/v19_tenant_ui_cleanup.py'
+      - '.github/workflows/v19-tenant-ui-retry.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  harden-tenant-ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v19-production-readiness
+      - name: Apply tenant and UI hardening
+        run: |
+          python3 tools/v19_tenant_ui_hardening.py
+          python3 tools/v19_tenant_ui_cleanup.py
+      - name: Install dependencies
+        working-directory: source
+        run: npm ci
+      - name: Global production blocker scan
+        working-directory: source
+        run: |
+          npm run check:production
+          if grep -R -n -E "market-1|branch-1|MOCK_USERS|defaultUsers|password:[[:space:]]*['\"]123456['\"]" src --include='*.ts' --include='*.tsx' --include='*.js' --include='*.jsx'; then
+            echo 'Production blocker remains in src.'
+            exit 1
+          fi
+      - name: TypeScript and production build
+        working-directory: source
+        run: |
+          npx tsc --noEmit
+          npm run build
+      - name: Commit verified tenant and UI hardening
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add source/src
+          if git diff --cached --quiet; then
+            echo 'Tenant/UI hardening already committed.'
+            exit 0
+          fi
+          git commit -m 'Remove fake tenant IDs and local demo user management'
+          git push origin HEAD:v19-production-readiness
