@@ -1,0 +1,90 @@
+name: V19 Encrypted Backup and Restore Drill
+
+on:
+  push:
+    branches:
+      - v19-production-readiness
+    paths:
+      - 'tools/v19_add_encrypted_backup.py'
+      - '.github/workflows/v19-encrypted-backup.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  backup-restore:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: zhirox
+          POSTGRES_PASSWORD: zhirox_test_password
+          POSTGRES_DB: zhirox_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zhirox -d zhirox_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://zhirox:zhirox_test_password@127.0.0.1:5432/zhirox_test
+      BACKUP_ENCRYPTION_KEY_B64: BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v19-production-readiness
+      - name: Generate encrypted backup system
+        run: python3 tools/v19_add_encrypted_backup.py
+      - name: Syntax-check backup and server modules
+        working-directory: source/server
+        run: |
+          node --check src/backup.mjs
+          node --check src/backupScheduler.mjs
+          node --check scripts/backup.mjs
+          node --check scripts/restore.mjs
+          node --check src/index.mjs
+      - name: Install and audit server
+        working-directory: source/server
+        run: |
+          npm ci
+          npm audit --omit=dev --audit-level=high
+      - name: Run encrypted backup destructive restore drill
+        working-directory: source/server
+        run: node test/backup-drill.mjs
+      - name: Run all PostgreSQL integration tests
+        working-directory: source/server
+        run: npm test
+      - name: Revalidate frontend production gates
+        working-directory: source
+        run: |
+          npm ci
+          npm run check:production
+          npx tsc --noEmit
+          npm run build
+      - name: Backup security gate
+        working-directory: source/server
+        run: |
+          if grep -R -n -E "BACKUP_ENCRYPTION_KEY_B64=.*[A-Za-z0-9+/]{20}" .env.example src scripts; then
+            echo 'Real backup encryption key must never be committed.'
+            exit 1
+          fi
+          if grep -R -n -E "createCipheriv\(['\"]aes-256-(cbc|ctr)" src scripts; then
+            echo 'Unauthenticated backup encryption mode is forbidden.'
+            exit 1
+          fi
+          grep -q "aes-256-gcm" src/backup.mjs
+          grep -q "ALLOW_RESTORE=YES" scripts/restore.mjs
+      - name: Commit verified encrypted backup system
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add source/server
+          if git diff --cached --quiet; then
+            echo 'Encrypted backup system already committed.'
+            exit 0
+          fi
+          git commit -m 'Add encrypted automatic backup and restore drill for v19'
+          git push origin HEAD:v19-production-readiness
