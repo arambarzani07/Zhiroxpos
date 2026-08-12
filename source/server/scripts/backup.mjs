@@ -1,0 +1,1 @@
+import pg from 'pg';import { createEncryptedBackup } from '../src/backup.mjs';const {Pool}=pg;if(!process.env.DATABASE_URL)throw new Error('DATABASE_URL is required');const pool=new Pool({connectionString:process.env.DATABASE_URL,max:2});try{const result=await createEncryptedBackup(pool);console.log(JSON.stringify(result));}finally{await pool.end();}

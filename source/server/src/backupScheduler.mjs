@@ -1,0 +1,12 @@
+import { createEncryptedBackup } from './backup.mjs';
+
+const businessParts=(timeZone)=>{const parts=new Intl.DateTimeFormat('en-CA',{timeZone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',hourCycle:'h23'}).formatToParts(new Date());return Object.fromEntries(parts.map(p=>[p.type,p.value]));};
+export async function runScheduledBackup(pool,{timeZone=process.env.MARKET_TIME_ZONE||'Asia/Baghdad',hour=Number(process.env.BACKUP_HOUR_LOCAL||2)}={}){
+  const parts=businessParts(timeZone);if(Number(parts.hour)<hour)return {skipped:'BEFORE_BACKUP_HOUR'};const date=`${parts.year}-${parts.month}-${parts.day}`;const client=await pool.connect();let runId;
+  try{
+    await client.query('BEGIN');await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",[`backup:${date}`]);const success=await client.query("SELECT id FROM backup_runs WHERE business_date=$1::date AND status='success' LIMIT 1",[date]);if(success.rows[0]){await client.query('COMMIT');return {skipped:'ALREADY_COMPLETED'};}const recent=await client.query("SELECT id FROM backup_runs WHERE business_date=$1::date AND status='running' AND started_at>now()-interval '2 hours' LIMIT 1",[date]);if(recent.rows[0]){await client.query('COMMIT');return {skipped:'ALREADY_RUNNING'};}runId=`backup-${date}-${Date.now()}`;await client.query("INSERT INTO backup_runs (id,business_date,status) VALUES ($1,$2::date,'running')",[runId,date]);await client.query('COMMIT');
+  }catch(error){await client.query('ROLLBACK').catch(()=>{});throw error;}finally{client.release();}
+  try{const result=await createEncryptedBackup(pool);await pool.query("UPDATE backup_runs SET status='success',file_name=$1,bytes=$2,table_counts=$3::jsonb,finished_at=now() WHERE id=$4",[result.fileName,result.bytes,JSON.stringify(result.counts),runId]);return {ok:true,...result};}catch(error){await pool.query("UPDATE backup_runs SET status='failed',error_code=$1,finished_at=now() WHERE id=$2",[String(error?.message||'BACKUP_FAILED').slice(0,200),runId]).catch(()=>{});throw error;}
+}
+
+export function startBackupScheduler(pool){if(process.env.AUTO_BACKUP!=='1')return ()=>{};let stopped=false;const tick=async()=>{if(stopped)return;try{await runScheduledBackup(pool);}catch(error){console.error('automatic backup failed',error);}};void tick();const timer=setInterval(()=>void tick(),30*60*1000);timer.unref?.();return()=>{stopped=true;clearInterval(timer);};}

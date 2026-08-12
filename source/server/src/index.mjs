@@ -1,6 +1,7 @@
 import http from 'node:http';
 import pg from 'pg';
 import { createHandler } from './app.mjs';
+import { startBackupScheduler } from './backupScheduler.mjs';
 
 const { Pool } = pg;
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
@@ -11,11 +12,13 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: Number(
 const handler = createHandler(pool);
 const port = Number(process.env.PORT || 8787);
 const server = http.createServer(handler);
+const stopBackupScheduler = startBackupScheduler(pool);
 
 server.listen(port, () => console.log(`ZHIROX POS server listening on ${port}`));
 
 const shutdown = async signal => {
   console.log(`${signal}: shutting down`);
+  stopBackupScheduler();
   server.close(async () => {
     await pool.end();
     process.exit(0);
