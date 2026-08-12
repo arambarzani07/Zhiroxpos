@@ -1,0 +1,36 @@
+name: Unpack source archive
+
+on:
+  push:
+    branches:
+      - v19-production-readiness
+    paths:
+      - '.github/workflows/unpack-source.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v19-production-readiness
+      - name: Unpack archived source
+        run: |
+          rm -rf source
+          mkdir -p source
+          unzip -q 'zhirox-hypermarket-management-system(1).zip' -d source
+      - name: Commit unpacked source
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add source
+          if git diff --cached --quiet; then
+            echo 'No source changes to commit.'
+            exit 0
+          fi
+          git commit -m 'Unpack archived Zhirox source for v19 hardening'
+          git push origin HEAD:v19-production-readiness
